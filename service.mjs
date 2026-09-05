@@ -83,12 +83,6 @@ async function withTimeout(promise, timeoutMs, label) {
 }
 
 async function autoScroll(page) {
-  for (let pass = 0; pass < 2; pass += 1) {
-    await page.mouse.wheel({ deltaY: 50_000 });
-    await new Promise((resolve) => setTimeout(resolve, 700));
-  }
-  await page.keyboard.press("Home");
-  await new Promise((resolve) => setTimeout(resolve, 300));
   const session = await page.createCDPSession();
   try {
     const metrics = await session.send("Page.getLayoutMetrics");
@@ -111,10 +105,12 @@ async function serializeDom(page) {
 
 async function prepareMedia(page) {
   await page.evaluate(async () => {
+    document.querySelectorAll("img[loading='lazy'],iframe[loading='lazy']").forEach((element) => element.setAttribute("loading", "eager"));
     document.querySelectorAll("video").forEach((video) => {
       video.muted = true;
       video.setAttribute("muted", "");
       video.setAttribute("playsinline", "");
+      video.preload = "auto";
       video.play().catch(() => undefined);
     });
     document.querySelectorAll("[aria-expanded='false']").forEach((element) => {
@@ -162,7 +158,7 @@ async function captureSite(sourceUrl, baseUrl) {
         if (window.rrweb?.record) {
           window.__originStopRrweb = window.rrweb.record({
             emit(event) {
-              if (window.__originRrwebEvents.length < 5000) window.__originRrwebEvents.push(event);
+              if (window.__originRrwebEvents.length < 1200) window.__originRrwebEvents.push(event);
             },
             recordCanvas: false,
             collectFonts: false,
@@ -202,7 +198,7 @@ async function captureSite(sourceUrl, baseUrl) {
       interactiveSignals: document.querySelectorAll("button,a,input,select,textarea,[role='button'],[aria-expanded],[data-animation],[class*='carousel'],[class*='slider']").length,
     }));
     stage("screenshot");
-    const screenshot = await withTimeout(page.screenshot({ fullPage: scrollHeight <= 24_000, type: "jpeg", quality: 72 }), 20_000, "Screenshot capture");
+    const screenshot = await withTimeout(page.screenshot({ fullPage: false, type: "jpeg", quality: 68 }), 12_000, "Screenshot capture");
     const viewports = [1440, 1024, 768, 390];
     stage("responsive");
     for (const width of viewports.slice(1)) {
