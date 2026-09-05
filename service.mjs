@@ -16,7 +16,9 @@ const MAX_BODY_BYTES = 64_000;
 const MAX_CAPTURE_MS = 120_000;
 const ARTIFACT_TTL_MS = 30 * 60_000;
 const artifacts = new Map();
+const jobs = new Map();
 let browserPromise;
+let captureQueue = Promise.resolve();
 
 function getBrowser() {
   if (!browserPromise) {
@@ -262,9 +264,38 @@ function replayDocument(artifact) {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rrweb-player@1.0.0-alpha.4/dist/style.css"><style>html,body,#replay{height:100%;margin:0;background:#fff}.rr-player{width:100%!important;height:100%!important}.rr-player__frame{width:100%!important;height:calc(100% - 80px)!important}</style></head><body><div id="replay"></div><script src="https://cdn.jsdelivr.net/npm/rrweb-player@1.0.0-alpha.4/dist/index.js"></script><script>new rrwebPlayer({target:document.getElementById('replay'),props:{events:${events},autoPlay:true,showController:true,width:1440,height:900}})</script></body></html>`;
 }
 
+function requestBaseUrl(request) {
+  const forwardedProto = String(request.headers["x-forwarded-proto"] || "https").split(",")[0];
+  const host = String(request.headers["x-forwarded-host"] || request.headers.host || "");
+  return PUBLIC_BASE_URL || `${forwardedProto}://${host}`;
+}
+
+function enqueueCapture(sourceUrl, baseUrl) {
+  const jobId = randomUUID();
+  jobs.set(jobId, { createdAt: Date.now(), state: "pending" });
+  captureQueue = captureQueue.catch(() => undefined).then(async () => {
+    const job = jobs.get(jobId);
+    if (!job) return;
+    jobs.set(jobId, { ...job, state: "running", startedAt: Date.now() });
+    try {
+      const artifact = await withTimeout(captureSite(sourceUrl, baseUrl), MAX_CAPTURE_MS, "Browser capture");
+      jobs.set(jobId, { ...jobs.get(jobId), state: "complete", completedAt: Date.now(), artifact });
+    } catch (error) {
+      jobs.set(jobId, {
+        ...jobs.get(jobId),
+        state: "failed",
+        completedAt: Date.now(),
+        error: error instanceof Error ? error.message : "Capture failed.",
+      });
+    }
+  });
+  return jobId;
+}
+
 setInterval(() => {
   const cutoff = Date.now() - ARTIFACT_TTL_MS;
   for (const [id, artifact] of artifacts) if (artifact.createdAt < cutoff) artifacts.delete(id);
+  for (const [id, job] of jobs) if (job.createdAt < cutoff) jobs.delete(id);
 }, 60_000).unref();
 
 const server = http.createServer(async (request, response) => {
@@ -284,14 +315,27 @@ const server = http.createServer(async (request, response) => {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": contentSecurityPolicy, "cache-control": "private, max-age=1800" });
       return response.end(replayDocument(artifact));
     }
-    if (request.method !== "POST" || request.url !== "/capture") return json(response, 404, { error: "Not found." });
+    const jobMatch = request.url?.match(/^\/capture\/jobs\/([a-f0-9-]+)$/i);
+    const isCaptureRequest = request.method === "POST" && request.url === "/capture";
+    const isJobStart = request.method === "POST" && request.url === "/capture/jobs";
+    const isJobPoll = request.method === "GET" && Boolean(jobMatch);
+    if (!isCaptureRequest && !isJobStart && !isJobPoll) return json(response, 404, { error: "Not found." });
     if (TOKEN && request.headers.authorization !== `Bearer ${TOKEN}`) return json(response, 401, { error: "Unauthorized." });
+    if (isJobPoll && jobMatch) {
+      const job = jobs.get(jobMatch[1]);
+      if (!job) return json(response, 404, { schemaVersion: "origin.capture-job/1", state: "failed", error: "Capture job expired or was not found." });
+      if (job.state === "complete") return json(response, 200, { schemaVersion: "origin.capture-job/1", jobId: jobMatch[1], state: "complete", artifact: job.artifact });
+      if (job.state === "failed") return json(response, 422, { schemaVersion: "origin.capture-job/1", jobId: jobMatch[1], state: "failed", error: job.error });
+      return json(response, 202, { schemaVersion: "origin.capture-job/1", jobId: jobMatch[1], state: job.state, pollAfterMs: 1500 });
+    }
     const body = await readJson(request);
     if (body.schemaVersion !== "origin.capture/2" || typeof body.url !== "string") return json(response, 400, { error: "Invalid capture request." });
     const sourceUrl = await validateTarget(body.url);
-    const forwardedProto = String(request.headers["x-forwarded-proto"] || "https").split(",")[0];
-    const host = String(request.headers["x-forwarded-host"] || request.headers.host || "");
-    const baseUrl = PUBLIC_BASE_URL || `${forwardedProto}://${host}`;
+    const baseUrl = requestBaseUrl(request);
+    if (isJobStart) {
+      const jobId = enqueueCapture(sourceUrl, baseUrl);
+      return json(response, 202, { schemaVersion: "origin.capture-job/1", jobId, state: "pending", pollAfterMs: 1500 });
+    }
     const result = await Promise.race([
       captureSite(sourceUrl, baseUrl),
       new Promise((_, reject) => setTimeout(() => reject(new Error("Browser capture timed out.")), MAX_CAPTURE_MS)),
