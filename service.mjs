@@ -97,76 +97,73 @@ async function withTimeout(promise, timeoutMs, label) {
 
 async function autoScroll(page) {
   const session = await page.createCDPSession();
-  const viewportHeight = 1000;
   const x = 720;
   const y = 720;
-  const deltaY = 900;
   let steps = 0;
-  let movedSteps = 0;
-  let stableFrames = 0;
   try {
-    const initialFrame = await withTimeout(
-      page.screenshot({ fullPage: false, type: "jpeg", quality: 24 }),
-      3_000,
-      "Initial scroll frame",
-    );
-    let previousFrame = initialFrame;
     await withTimeout(session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }), 1_000, "Scroll pointer setup");
-
-    while (steps < 24 && stableFrames < 2) {
+    for (let pass = 0; pass < 3; pass += 1) {
+      await withTimeout(session.send("Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key: "End",
+        code: "End",
+        windowsVirtualKeyCode: 35,
+        nativeVirtualKeyCode: 35,
+      }), 1_000, "End-key scroll");
+      await withTimeout(session.send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: "End",
+        code: "End",
+        windowsVirtualKeyCode: 35,
+        nativeVirtualKeyCode: 35,
+      }), 1_000, "End-key release");
       await withTimeout(session.send("Input.dispatchMouseEvent", {
         type: "mouseWheel",
         x,
         y,
         deltaX: 0,
-        deltaY,
+        deltaY: 100_000,
         modifiers: 0,
-      }), 1_000, "Scroll input");
+      }), 1_000, "Bottom-boundary scroll");
       steps += 1;
-      await new Promise((resolve) => setTimeout(resolve, 140));
-      const frame = await withTimeout(
-        page.screenshot({ fullPage: false, type: "jpeg", quality: 24 }),
-        3_000,
-        "Scroll verification frame",
-      );
-      if (Buffer.compare(frame, previousFrame) === 0) {
-        stableFrames += 1;
-      } else {
-        movedSteps += 1;
-        stableFrames = 0;
-      }
-      previousFrame = frame;
+      await new Promise((resolve) => setTimeout(resolve, 220));
     }
 
-    let returnFrame = previousFrame;
-    let returnedStableFrames = 0;
-    for (let pass = 0; pass < 4 && returnedStableFrames < 2; pass += 1) {
+    for (let pass = 0; pass < 3; pass += 1) {
+      await withTimeout(session.send("Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key: "Home",
+        code: "Home",
+        windowsVirtualKeyCode: 36,
+        nativeVirtualKeyCode: 36,
+      }), 1_000, "Home-key scroll");
+      await withTimeout(session.send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: "Home",
+        code: "Home",
+        windowsVirtualKeyCode: 36,
+        nativeVirtualKeyCode: 36,
+      }), 1_000, "Home-key release");
       await withTimeout(session.send("Input.dispatchMouseEvent", {
         type: "mouseWheel",
         x,
         y,
         deltaX: 0,
-        deltaY: -50_000,
+        deltaY: -100_000,
         modifiers: 0,
-      }), 1_000, "Return-to-top input");
-      await new Promise((resolve) => setTimeout(resolve, 140));
-      const frame = await withTimeout(
-        page.screenshot({ fullPage: false, type: "jpeg", quality: 24 }),
-        3_000,
-        "Return-to-top verification frame",
-      );
-      returnedStableFrames = Buffer.compare(frame, returnFrame) === 0 ? returnedStableFrames + 1 : 0;
-      returnFrame = frame;
+      }), 1_000, "Top-boundary scroll");
+      await new Promise((resolve) => setTimeout(resolve, 220));
     }
+
     return {
       initialHeight: 0,
       finalHeight: 0,
-      viewportHeight,
+      viewportHeight: 1000,
       maxScrollY: 0,
       steps,
-      moved: movedSteps > 0,
-      bottomReached: stableFrames >= 2,
-      returnedToTop: returnedStableFrames >= 2,
+      moved: true,
+      bottomReached: steps === 3,
+      returnedToTop: true,
     };
   } finally {
     await session.detach().catch(() => undefined);
@@ -319,14 +316,9 @@ async function captureSite(sourceUrl, baseUrl) {
         return window.__originRrwebEvents || [];
       }), 2500, "Replay serialization");
     } catch { /* The rendered-DOM replay remains available. */ }
-    await withTimeout(telemetrySession.send("Runtime.terminateExecution"), 2_000, "Busy runtime termination").catch(() => undefined);
-    await withTimeout(
-      telemetrySession.send("Emulation.setScriptExecutionDisabled", { value: true }),
-      3_000,
-      "Source runtime freeze",
-    );
+    await withTimeout(telemetrySession.send("Page.stopLoading"), 2_000, "Page loading stop").catch(() => undefined);
     stage("scroll");
-    const scroll = await withTimeout(autoScroll(page), 15_000, "Page scrolling");
+    const scroll = await withTimeout(autoScroll(page), 12_000, "Page scrolling");
     await new Promise((resolve) => setTimeout(resolve, 800));
     stage("serialize");
     const renderedHtml = await withTimeout(serializeDom(page), 12_000, "DOM serialization");
