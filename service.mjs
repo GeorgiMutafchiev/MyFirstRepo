@@ -171,7 +171,7 @@ async function captureSite(sourceUrl, baseUrl) {
     if (!response || response.status() >= 400) throw new Error(`The browser navigation returned HTTP ${response?.status() || "unknown"}.`);
     await new Promise((resolve) => setTimeout(resolve, 1800));
     stage("media");
-    await withTimeout(prepareMedia(page), 8000, "Media preparation");
+    await withTimeout(prepareMedia(page), 8000, "Media preparation").catch(() => undefined);
     stage("scroll");
     const scrollHeight = await withTimeout(autoScroll(page), 20_000, "Page scrolling");
     await new Promise((resolve) => setTimeout(resolve, 800));
