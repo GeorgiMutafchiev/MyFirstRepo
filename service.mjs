@@ -106,8 +106,7 @@ async function prepareMedia(page) {
 
 async function captureSite(sourceUrl, baseUrl) {
   const browser = await getBrowser();
-  const context = await browser.createBrowserContext();
-  const page = await context.newPage();
+  const page = await browser.newPage();
   await page.setRequestInterception(true);
   page.on("request", async (request) => {
     if (!request.isNavigationRequest() || request.resourceType() !== "document") return request.continue();
@@ -200,7 +199,7 @@ async function captureSite(sourceUrl, baseUrl) {
       blockers: [...runtimeErrors.slice(0, 5), ...criticalFailures.slice(0, 10)],
     };
   } finally {
-    await context.close().catch(() => undefined);
+    await page.close().catch(() => undefined);
   }
 }
 
