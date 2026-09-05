@@ -86,10 +86,10 @@ async function autoScroll(page) {
   let previousHeight = 0;
   let stablePasses = 0;
   let scrollHeight = 0;
-  for (let pass = 0; pass < 60 && stablePasses < 3; pass += 1) {
-    await page.mouse.wheel({ deltaY: 900 });
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    if (pass % 6 !== 5) continue;
+  for (let pass = 0; pass < 18 && stablePasses < 2; pass += 1) {
+    await page.mouse.wheel({ deltaY: 4500 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (pass % 3 !== 2) continue;
     const position = await withTimeout(page.evaluate(() => {
       const root = document.scrollingElement || document.documentElement;
       return {
