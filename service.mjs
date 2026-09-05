@@ -83,9 +83,9 @@ async function withTimeout(promise, timeoutMs, label) {
 }
 
 async function autoScroll(page) {
-  for (let pass = 0; pass < 6; pass += 1) {
-    await page.mouse.wheel({ deltaY: 15_000 });
-    await new Promise((resolve) => setTimeout(resolve, 120));
+  for (let pass = 0; pass < 2; pass += 1) {
+    await page.mouse.wheel({ deltaY: 50_000 });
+    await new Promise((resolve) => setTimeout(resolve, 700));
   }
   await page.keyboard.press("Home");
   await new Promise((resolve) => setTimeout(resolve, 300));
@@ -208,12 +208,12 @@ async function captureSite(sourceUrl, baseUrl) {
     for (const width of viewports.slice(1)) {
       await page.setViewport({ width, height: width === 390 ? 844 : 900 });
       await new Promise((resolve) => setTimeout(resolve, 280));
-      await page.evaluate(async () => {
-        const root = document.scrollingElement || document.documentElement;
-        root.scrollTo({ top: root.scrollHeight, behavior: "instant" });
-        await new Promise((resolve) => setTimeout(resolve, 320));
-        root.scrollTo({ top: 0, behavior: "instant" });
-      });
+      const session = await page.createCDPSession();
+      try {
+        await withTimeout(session.send("Page.getLayoutMetrics"), 5000, `${width}px layout validation`);
+      } finally {
+        await session.detach().catch(() => undefined);
+      }
     }
     artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, sourceUrl: sourceUrl.toString() });
     const checks = {
