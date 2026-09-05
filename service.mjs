@@ -68,25 +68,44 @@ async function readJson(request) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
+async function withTimeout(promise, timeoutMs, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms.`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function autoScroll(page) {
-  return page.evaluate(async () => {
-    const root = document.scrollingElement || document.documentElement;
-    let previousHeight = 0;
-    let stablePasses = 0;
-    for (let pass = 0; pass < 90 && stablePasses < 4; pass += 1) {
-      const height = Math.max(root.scrollHeight, document.body?.scrollHeight || 0);
-      const next = Math.min(root.scrollTop + Math.max(320, innerHeight * 0.72), height);
-      root.scrollTo({ top: next, behavior: "instant" });
-      await new Promise((resolve) => setTimeout(resolve, 75));
-      const newHeight = Math.max(root.scrollHeight, document.body?.scrollHeight || 0);
-      if (next + innerHeight >= newHeight - 4 && newHeight === previousHeight) stablePasses += 1;
-      else stablePasses = 0;
-      previousHeight = newHeight;
-    }
-    root.scrollTo({ top: 0, behavior: "instant" });
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    return Math.max(root.scrollHeight, document.body?.scrollHeight || 0);
-  });
+  let previousHeight = 0;
+  let stablePasses = 0;
+  let scrollHeight = 0;
+  for (let pass = 0; pass < 60 && stablePasses < 3; pass += 1) {
+    await page.mouse.wheel({ deltaY: 900 });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    if (pass % 6 !== 5) continue;
+    const position = await withTimeout(page.evaluate(() => {
+      const root = document.scrollingElement || document.documentElement;
+      return {
+        top: root.scrollTop,
+        height: Math.max(root.scrollHeight, document.body?.scrollHeight || 0),
+        viewport: innerHeight,
+      };
+    }), 3000, "Scroll measurement");
+    scrollHeight = position.height;
+    if (position.top + position.viewport >= position.height - 4 && position.height === previousHeight) stablePasses += 1;
+    else stablePasses = 0;
+    previousHeight = position.height;
+  }
+  await page.keyboard.press("Home");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  return scrollHeight || previousHeight;
 }
 
 async function prepareMedia(page) {
@@ -156,16 +175,16 @@ async function captureSite(sourceUrl, baseUrl) {
     if (!response || response.status() >= 400) throw new Error(`The browser navigation returned HTTP ${response?.status() || "unknown"}.`);
     await new Promise((resolve) => setTimeout(resolve, 1800));
     stage("media");
-    await prepareMedia(page);
+    await withTimeout(prepareMedia(page), 8000, "Media preparation");
     stage("scroll");
-    const scrollHeight = await autoScroll(page);
+    const scrollHeight = await withTimeout(autoScroll(page), 20_000, "Page scrolling");
     await new Promise((resolve) => setTimeout(resolve, 800));
     stage("serialize");
-    const renderedHtml = await page.evaluate(() => `<!doctype html>\n${document.documentElement.outerHTML}`);
-    const events = await page.evaluate(() => {
+    const renderedHtml = await withTimeout(page.evaluate(() => `<!doctype html>\n${document.documentElement.outerHTML}`), 12_000, "DOM serialization");
+    const events = await withTimeout(page.evaluate(() => {
       if (typeof window.__originStopRrweb === "function") window.__originStopRrweb();
       return window.__originRrwebEvents || [];
-    });
+    }), 12_000, "Replay serialization");
     const metrics = await page.evaluate(() => ({
       elements: document.querySelectorAll("*").length,
       stylesheets: document.styleSheets.length,
@@ -177,7 +196,7 @@ async function captureSite(sourceUrl, baseUrl) {
       interactiveSignals: document.querySelectorAll("button,a,input,select,textarea,[role='button'],[aria-expanded],[data-animation],[class*='carousel'],[class*='slider']").length,
     }));
     stage("screenshot");
-    const screenshot = await page.screenshot({ fullPage: scrollHeight <= 24_000, type: "jpeg", quality: 72 });
+    const screenshot = await withTimeout(page.screenshot({ fullPage: scrollHeight <= 24_000, type: "jpeg", quality: 72 }), 20_000, "Screenshot capture");
     const viewports = [1440, 1024, 768, 390];
     stage("responsive");
     for (const width of viewports.slice(1)) {
