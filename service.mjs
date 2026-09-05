@@ -17,6 +17,9 @@ const MAX_CAPTURE_MS = 120_000;
 const ARTIFACT_TTL_MS = 30 * 60_000;
 const artifacts = new Map();
 const jobs = new Map();
+const dnsCache = new Map();
+const MAX_RETAINED_CAPTURES = 3;
+const JOB_TTL_MS = 10 * 60_000;
 let browserPromise;
 let captureQueue = Promise.resolve();
 
@@ -54,7 +57,14 @@ async function validateTarget(rawUrl) {
   const url = new URL(rawUrl);
   if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("Only HTTP and HTTPS URLs are supported.");
   if (url.username || url.password) throw new Error("URLs containing credentials are not supported.");
-  const records = await dns.lookup(url.hostname, { all: true, verbatim: true });
+  const cached = dnsCache.get(url.hostname);
+  const records = cached?.expiresAt > Date.now()
+    ? cached.records
+    : await dns.lookup(url.hostname, { all: true, verbatim: true });
+  if (!cached || cached.expiresAt <= Date.now()) {
+    dnsCache.set(url.hostname, { records, expiresAt: Date.now() + 5 * 60_000 });
+    if (dnsCache.size > 256) dnsCache.delete(dnsCache.keys().next().value);
+  }
   if (!records.length || records.some((record) => isPrivateAddress(record.address))) throw new Error("Private and local network targets are blocked.");
   return url;
 }
@@ -84,11 +94,80 @@ async function withTimeout(promise, timeoutMs, label) {
   }
 }
 
+async function readLayoutMetrics(session) {
+  const metrics = await session.send("Page.getLayoutMetrics");
+  const viewport = metrics.cssLayoutViewport || metrics.layoutViewport || {};
+  const visualViewport = metrics.cssVisualViewport || metrics.visualViewport || {};
+  const content = metrics.cssContentSize || metrics.contentSize || {};
+  return {
+    width: Math.ceil(content.width || viewport.clientWidth || 0),
+    height: Math.ceil(content.height || viewport.clientHeight || 0),
+    viewportWidth: Math.ceil(viewport.clientWidth || visualViewport.clientWidth || 0),
+    viewportHeight: Math.ceil(viewport.clientHeight || visualViewport.clientHeight || 0),
+    scrollY: Math.max(0, Math.round(visualViewport.pageY ?? viewport.pageY ?? 0)),
+  };
+}
+
 async function autoScroll(page) {
   const session = await page.createCDPSession();
   try {
-    const metrics = await session.send("Page.getLayoutMetrics");
-    return Math.ceil(metrics.cssContentSize?.height || metrics.contentSize?.height || 0);
+    let metrics = await readLayoutMetrics(session);
+    const initialHeight = metrics.height;
+    const initialViewportHeight = metrics.viewportHeight;
+    let maxScrollY = metrics.scrollY;
+    let steps = 0;
+    let stableBottomPasses = 0;
+    const x = Math.max(1, Math.floor(metrics.viewportWidth / 2));
+    const y = Math.max(1, Math.floor(metrics.viewportHeight * 0.72));
+
+    while (steps < 40 && stableBottomPasses < 2) {
+      const scrollable = metrics.height > metrics.viewportHeight + 8;
+      if (!scrollable) break;
+      const previousHeight = metrics.height;
+      await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      await session.send("Input.dispatchMouseEvent", {
+        type: "mouseWheel",
+        x,
+        y,
+        deltaX: 0,
+        deltaY: Math.max(700, Math.min(5000, Math.floor(metrics.viewportHeight * 0.9))),
+        modifiers: 0,
+      });
+      steps += 1;
+      await new Promise((resolve) => setTimeout(resolve, 140));
+      metrics = await readLayoutMetrics(session);
+      maxScrollY = Math.max(maxScrollY, metrics.scrollY);
+      const grew = metrics.height > previousHeight + 4;
+      const atBottom = metrics.scrollY + metrics.viewportHeight >= metrics.height - 12;
+      stableBottomPasses = atBottom && !grew ? stableBottomPasses + 1 : 0;
+    }
+
+    const finalHeight = metrics.height;
+    const bottomReached = finalHeight <= metrics.viewportHeight + 8
+      || maxScrollY + metrics.viewportHeight >= finalHeight - 12;
+
+    for (let pass = 0; pass < 4 && metrics.scrollY > 2; pass += 1) {
+      await session.send("Input.dispatchMouseEvent", {
+        type: "mouseWheel",
+        x,
+        y,
+        deltaX: 0,
+        deltaY: -Math.max(50_000, finalHeight),
+        modifiers: 0,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      metrics = await readLayoutMetrics(session);
+    }
+
+    return {
+      initialHeight,
+      finalHeight,
+      viewportHeight: initialViewportHeight,
+      maxScrollY,
+      steps,
+      bottomReached,
+      returnedToTop: metrics.scrollY <= 2,
+    };
   } finally {
     await session.detach().catch(() => undefined);
   }
@@ -122,6 +201,33 @@ async function prepareMedia(page) {
   });
 }
 
+function countMatches(value, expression) {
+  return value.match(expression)?.length || 0;
+}
+
+function summarizeMarkup(renderedHtml) {
+  return {
+    elements: countMatches(renderedHtml, /<(?!\/|!|\?)[a-z][^>]*>/gi),
+    stylesheets: countMatches(renderedHtml, /<style\b|<link\b[^>]*\brel=["']?stylesheet/gi),
+    scripts: countMatches(renderedHtml, /<script\b/gi),
+    images: countMatches(renderedHtml, /<img\b/gi),
+    videos: countMatches(renderedHtml, /<(?:video|source)\b[^>]*(?:type=["']video|<video\b)/gi),
+    canvases: countMatches(renderedHtml, /<(?:canvas|svg)\b/gi),
+    customElements: countMatches(renderedHtml, /<[a-z][a-z0-9]*-[a-z0-9-]+\b/gi),
+    interactiveSignals: countMatches(renderedHtml, /<(?:button|a|input|select|textarea)\b|\brole=["']button|\baria-expanded=|\bdata-animation=|\bclass=["'][^"']*(?:carousel|slider)/gi),
+  };
+}
+
+function normalizeRuntimeUrl(value) {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
 async function captureSite(sourceUrl, baseUrl) {
   const captureId = randomUUID();
   const startedAt = Date.now();
@@ -129,21 +235,51 @@ async function captureSite(sourceUrl, baseUrl) {
   stage("browser");
   const browser = await getBrowser();
   const page = await browser.newPage();
+  const telemetrySession = await page.createCDPSession();
+  const runtimeErrors = [];
+  const criticalFailures = [];
+  const scriptRequests = new Set();
+  const executedScripts = new Set();
+  const animations = new Map();
+  let networkRequests = 0;
+
+  telemetrySession.on("Debugger.scriptParsed", (event) => {
+    if (event.url && executedScripts.size < 600) executedScripts.add(normalizeRuntimeUrl(event.url));
+  });
+  telemetrySession.on("Animation.animationStarted", ({ animation }) => {
+    if (!animation?.id || animations.size >= 300) return;
+    animations.set(animation.id, {
+      name: animation.name || "",
+      type: animation.type || "",
+      playState: animation.playState || "",
+      duration: animation.source?.duration || 0,
+      delay: animation.source?.delay || 0,
+      iterations: animation.source?.iterations || 0,
+      direction: animation.source?.direction || "",
+      easing: animation.source?.easing || "",
+    });
+  });
+  await withTimeout(telemetrySession.send("Debugger.enable"), 3000, "Script telemetry").catch((error) => {
+    runtimeErrors.push(error instanceof Error ? error.message : "Script telemetry failed.");
+  });
+  await withTimeout(telemetrySession.send("Animation.enable"), 3000, "Animation telemetry").catch((error) => {
+    runtimeErrors.push(error instanceof Error ? error.message : "Animation telemetry failed.");
+  });
+
   await page.setRequestInterception(true);
   page.on("request", async (request) => {
-    if (!request.isNavigationRequest() || request.resourceType() !== "document") return request.continue();
+    networkRequests += 1;
+    if (request.resourceType() === "script" && scriptRequests.size < 600) scriptRequests.add(normalizeRuntimeUrl(request.url()));
     try {
-      await validateTarget(request.url());
+      const target = new URL(request.url());
+      if (target.protocol === "http:" || target.protocol === "https:") await validateTarget(target.toString());
+      else if (!["data:", "blob:", "about:"].includes(target.protocol)) throw new Error("Blocked non-web request.");
       return request.continue();
     } catch {
       return request.abort("blockedbyclient");
     }
   });
-  const runtimeErrors = [];
-  const criticalFailures = [];
-  let networkRequests = 0;
   page.on("pageerror", (error) => runtimeErrors.push(String(error.message || error)));
-  page.on("request", () => { networkRequests += 1; });
   page.on("requestfailed", (request) => {
     const type = request.resourceType();
     try {
@@ -176,7 +312,7 @@ async function captureSite(sourceUrl, baseUrl) {
     stage("media");
     await withTimeout(prepareMedia(page), 8000, "Media preparation").catch(() => undefined);
     stage("scroll");
-    const scrollHeight = await withTimeout(autoScroll(page), 20_000, "Page scrolling");
+    const scroll = await withTimeout(autoScroll(page), 20_000, "Page scrolling");
     await new Promise((resolve) => setTimeout(resolve, 800));
     stage("serialize");
     const renderedHtml = await withTimeout(serializeDom(page), 12_000, "DOM serialization");
@@ -189,16 +325,10 @@ async function captureSite(sourceUrl, baseUrl) {
     } catch (error) {
       runtimeErrors.push(error instanceof Error ? error.message : "Replay serialization failed.");
     }
-    const metrics = await page.evaluate(() => ({
-      elements: document.querySelectorAll("*").length,
-      stylesheets: document.styleSheets.length,
-      scripts: document.scripts.length,
-      images: document.images.length,
-      videos: document.querySelectorAll("video,source[type^='video']").length,
-      canvases: document.querySelectorAll("canvas,svg").length,
-      customElements: [...document.querySelectorAll("*")].filter((element) => element.localName.includes("-")).length,
-      interactiveSignals: document.querySelectorAll("button,a,input,select,textarea,[role='button'],[aria-expanded],[data-animation],[class*='carousel'],[class*='slider']").length,
-    }));
+    const metrics = summarizeMarkup(renderedHtml);
+    const discoveredScriptUrls = [...scriptRequests];
+    const executedScriptUrls = new Set(executedScripts);
+    const unexecutedScriptUrls = discoveredScriptUrls.filter((url) => !executedScriptUrls.has(url));
     stage("screenshot");
     const screenshot = await withTimeout(page.screenshot({ fullPage: false, type: "jpeg", quality: 68 }), 12_000, "Screenshot capture");
     const viewports = [1440, 1024, 768, 390];
@@ -220,17 +350,22 @@ async function captureSite(sourceUrl, baseUrl) {
       }
     }
     artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, renderedHtml, sourceUrl: sourceUrl.toString() });
+    while (artifacts.size > MAX_RETAINED_CAPTURES) artifacts.delete(artifacts.keys().next().value);
+    const pageWasScrollable = scroll.finalHeight > scroll.viewportHeight + 8;
     const checks = {
       loaded: true,
-      scrolled: scrollHeight > 0,
+      scrolled: !pageWasScrollable || (scroll.maxScrollY > 0 && scroll.bottomReached),
+      returnedToTop: scroll.returnedToTop,
       replayable: events.length > 1,
       responsive: responsiveViewports === viewports.length,
       domCaptured: renderedHtml.length > 100,
+      runtimeScriptsExecuted: unexecutedScriptUrls.length === 0,
     };
     const verified = Object.values(checks).every(Boolean) && criticalFailures.length === 0 && runtimeErrors.length === 0;
     return {
       schemaVersion: "origin.capture/2",
       provider: "origin-puppeteer-rrweb",
+      captureId,
       state: verified ? "verified" : "partial",
       sourceUrl: sourceUrl.toString(),
       replayUrl: `${baseUrl}/captures/${captureId}/replay`,
@@ -238,19 +373,34 @@ async function captureSite(sourceUrl, baseUrl) {
       capturedAt: new Date().toISOString(),
       renderedHtml,
       checks,
+      motion: [...animations.values()].slice(0, 120),
       evidence: {
         htmlBytes: Buffer.byteLength(renderedHtml),
         ...metrics,
         viewports: responsiveViewports,
-        scrollHeight,
+        scrollHeight: scroll.finalHeight,
+        initialScrollHeight: scroll.initialHeight,
+        scrollSteps: scroll.steps,
+        maxScrollY: scroll.maxScrollY,
+        bottomReached: scroll.bottomReached,
+        returnedToTop: scroll.returnedToTop,
         networkRequests,
+        runtimeScriptsDiscovered: discoveredScriptUrls.length,
+        runtimeScriptsExecuted: discoveredScriptUrls.length - unexecutedScriptUrls.length,
+        runtimeScriptsUnexecuted: unexecutedScriptUrls.length,
+        animationsStarted: animations.size,
         criticalNetworkFailures: criticalFailures.length,
         runtimeErrors: runtimeErrors.length,
       },
-      blockers: [...runtimeErrors.slice(0, 5), ...criticalFailures.slice(0, 10)],
+      blockers: [
+        ...runtimeErrors.slice(0, 5),
+        ...criticalFailures.slice(0, 10),
+        ...unexecutedScriptUrls.slice(0, 10).map((url) => `script not executed: ${url}`),
+      ],
     };
   } finally {
     stage("cleanup");
+    await telemetrySession.detach().catch(() => undefined);
     await page.close().catch(() => undefined);
   }
 }
@@ -280,22 +430,35 @@ function enqueueCapture(sourceUrl, baseUrl) {
     try {
       const artifact = await withTimeout(captureSite(sourceUrl, baseUrl), MAX_CAPTURE_MS, "Browser capture");
       jobs.set(jobId, { ...jobs.get(jobId), state: "complete", completedAt: Date.now(), artifact });
+      console.log(JSON.stringify({
+        jobId,
+        stage: "job-complete",
+        sourceUrl: sourceUrl.toString(),
+        state: artifact.state,
+        checks: artifact.checks,
+        evidence: artifact.evidence,
+        blockers: artifact.blockers,
+      }));
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Capture failed.";
       jobs.set(jobId, {
         ...jobs.get(jobId),
         state: "failed",
         completedAt: Date.now(),
-        error: error instanceof Error ? error.message : "Capture failed.",
+        error: message,
       });
+      console.error(JSON.stringify({ jobId, stage: "job-failed", sourceUrl: sourceUrl.toString(), error: message }));
     }
   });
   return jobId;
 }
 
 setInterval(() => {
-  const cutoff = Date.now() - ARTIFACT_TTL_MS;
-  for (const [id, artifact] of artifacts) if (artifact.createdAt < cutoff) artifacts.delete(id);
-  for (const [id, job] of jobs) if (job.createdAt < cutoff) jobs.delete(id);
+  const artifactCutoff = Date.now() - ARTIFACT_TTL_MS;
+  const jobCutoff = Date.now() - JOB_TTL_MS;
+  for (const [id, artifact] of artifacts) if (artifact.createdAt < artifactCutoff) artifacts.delete(id);
+  for (const [id, job] of jobs) if (job.createdAt < jobCutoff) jobs.delete(id);
+  while (jobs.size > 12) jobs.delete(jobs.keys().next().value);
 }, 60_000).unref();
 
 const server = http.createServer(async (request, response) => {
