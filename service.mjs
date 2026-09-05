@@ -194,6 +194,44 @@ function normalizeRuntimeUrl(value) {
   }
 }
 
+function absolutizeCssUrls(source, sourceUrl) {
+  return source.replace(/url\s*\(\s*(["']?)([^"')]+)\1\s*\)/gi, (match, quote, rawUrl) => {
+    const value = rawUrl.trim();
+    if (!value || /^(?:data:|blob:|#)/i.test(value)) return match;
+    try {
+      return `url("${new URL(value, sourceUrl).toString().replaceAll('"', "%22")}")`;
+    } catch {
+      return match;
+    }
+  });
+}
+
+async function captureLoadedCss(session, stylesheetHeaders) {
+  const headers = [...stylesheetHeaders.values()].filter((header) => header.sourceURL).slice(0, 48);
+  const results = await Promise.all(headers.map(async (header) => {
+    try {
+      const result = await withTimeout(
+        session.send("CSS.getStyleSheetText", { styleSheetId: header.styleSheetId }),
+        2_500,
+        "Stylesheet capture",
+      );
+      return absolutizeCssUrls(result.text || "", header.sourceURL);
+    } catch {
+      return "";
+    }
+  }));
+  let capturedCss = "";
+  let stylesheetsCaptured = 0;
+  for (const result of results) {
+    if (!result) continue;
+    const remaining = 1_500_000 - capturedCss.length;
+    if (remaining <= 0) break;
+    capturedCss += `${result.slice(0, remaining)}\n`;
+    stylesheetsCaptured += 1;
+  }
+  return { capturedCss, stylesheetsCaptured };
+}
+
 async function captureSite(sourceUrl, baseUrl) {
   const captureId = randomUUID();
   const startedAt = Date.now();
@@ -207,6 +245,7 @@ async function captureSite(sourceUrl, baseUrl) {
   const scriptRequests = new Set();
   const executedScripts = new Set();
   const animations = new Map();
+  const stylesheetHeaders = new Map();
   let networkRequests = 0;
 
   telemetrySession.on("Debugger.scriptParsed", (event) => {
@@ -225,12 +264,17 @@ async function captureSite(sourceUrl, baseUrl) {
       easing: animation.source?.easing || "",
     });
   });
+  telemetrySession.on("CSS.styleSheetAdded", ({ header }) => {
+    if (header?.styleSheetId && stylesheetHeaders.size < 80) stylesheetHeaders.set(header.styleSheetId, header);
+  });
   await withTimeout(telemetrySession.send("Debugger.enable"), 3000, "Script telemetry").catch((error) => {
     runtimeErrors.push(error instanceof Error ? error.message : "Script telemetry failed.");
   });
   await withTimeout(telemetrySession.send("Animation.enable"), 3000, "Animation telemetry").catch((error) => {
     runtimeErrors.push(error instanceof Error ? error.message : "Animation telemetry failed.");
   });
+  await withTimeout(telemetrySession.send("DOM.enable"), 3000, "DOM telemetry").catch(() => undefined);
+  await withTimeout(telemetrySession.send("CSS.enable"), 3000, "Stylesheet telemetry").catch(() => undefined);
 
   await page.setRequestInterception(true);
   page.on("request", async (request) => {
@@ -277,7 +321,9 @@ async function captureSite(sourceUrl, baseUrl) {
     await new Promise((resolve) => setTimeout(resolve, 1800));
     stage("media");
     await withTimeout(prepareMedia(page), 8000, "Media preparation").catch(() => undefined);
-    stage("freeze");
+    stage("styles");
+    const { capturedCss, stylesheetsCaptured } = await captureLoadedCss(telemetrySession, stylesheetHeaders);
+    stage("replay");
     let events = [];
     try {
       events = await withTimeout(page.evaluate(() => {
@@ -285,6 +331,10 @@ async function captureSite(sourceUrl, baseUrl) {
         return window.__originRrwebEvents || [];
       }), 2500, "Replay serialization");
     } catch { /* The rendered-DOM replay remains available. */ }
+    const replayTimestamps = events.map((event) => Number(event?.timestamp) || 0).filter(Boolean);
+    const replayDurationMs = replayTimestamps.length > 1 ? Math.max(...replayTimestamps) - Math.min(...replayTimestamps) : 0;
+    const replayMutations = events.filter((event) => event?.type === 3 && event?.data?.source === 0).length;
+    const replayReady = events.length >= 10 && replayDurationMs >= 5_000 && replayMutations > 0;
     await withTimeout(telemetrySession.send("Page.stopLoading"), 2_000, "Page loading stop").catch(() => undefined);
     stage("scroll");
     const scroll = await withTimeout(autoScroll(page), 12_000, "Page scrolling");
@@ -310,13 +360,13 @@ async function captureSite(sourceUrl, baseUrl) {
         runtimeErrors.push(error instanceof Error ? error.message : `${width}px layout validation failed.`);
       }
     }
-    artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, renderedHtml, sourceUrl: sourceUrl.toString() });
+    artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, replayReady, renderedHtml, sourceUrl: sourceUrl.toString() });
     while (artifacts.size > MAX_RETAINED_CAPTURES) artifacts.delete(artifacts.keys().next().value);
     const checks = {
       loaded: true,
       scrolled: scroll.bottomReached,
       returnedToTop: scroll.returnedToTop,
-      replayable: events.length > 1 || renderedHtml.length > 100,
+      replayable: replayReady,
       responsive: responsiveViewports === viewports.length,
       domCaptured: renderedHtml.length > 100,
       runtimeScriptsExecuted: unexecutedScriptUrls.length === 0,
@@ -332,6 +382,7 @@ async function captureSite(sourceUrl, baseUrl) {
       screenshotUrl: `${baseUrl}/captures/${captureId}/screenshot.jpg`,
       capturedAt: new Date().toISOString(),
       renderedHtml,
+      capturedCss,
       checks,
       motion: [...animations.values()].slice(0, 120),
       evidence: {
@@ -349,6 +400,11 @@ async function captureSite(sourceUrl, baseUrl) {
         runtimeScriptsExecuted: discoveredScriptUrls.length - unexecutedScriptUrls.length,
         runtimeScriptsUnexecuted: unexecutedScriptUrls.length,
         animationsStarted: animations.size,
+        replayEvents: events.length,
+        replayDurationMs,
+        replayMutations,
+        stylesheetsCaptured,
+        cssBytes: Buffer.byteLength(capturedCss),
         criticalNetworkFailures: criticalFailures.length,
         runtimeErrors: runtimeErrors.length,
       },
@@ -366,7 +422,7 @@ async function captureSite(sourceUrl, baseUrl) {
 }
 
 function replayDocument(artifact) {
-  if (artifact.events.length < 2) {
+  if (!artifact.replayReady) {
     const base = `<base href="${artifact.sourceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">`;
     return artifact.renderedHtml.replace(/<head([^>]*)>/i, `<head$1>${base}`);
   }
@@ -469,7 +525,7 @@ const server = http.createServer(async (request, response) => {
         response.writeHead(200, { "content-type": "image/jpeg", "cache-control": "private, max-age=1800" });
         return response.end(artifact.screenshot);
       }
-      const contentSecurityPolicy = artifact.events.length > 1
+      const contentSecurityPolicy = artifact.replayReady
         ? "default-src 'self' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src * data: blob:; media-src * data: blob:; font-src * data:"
         : "default-src 'none'; script-src 'none'; style-src 'unsafe-inline' https:; img-src data: blob: https:; media-src data: blob: https:; font-src data: https:; frame-src https:; form-action 'none'; base-uri https:";
       response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": contentSecurityPolicy, "cache-control": "private, max-age=1800" });
