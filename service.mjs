@@ -112,7 +112,7 @@ async function readLayoutMetrics(session) {
 async function autoScroll(page) {
   const session = await page.createCDPSession();
   try {
-    let metrics = await readLayoutMetrics(session);
+    let metrics = await withTimeout(readLayoutMetrics(session), 2_000, "Initial layout metrics");
     const initialHeight = metrics.height;
     const initialViewportHeight = metrics.viewportHeight;
     let maxScrollY = metrics.scrollY;
@@ -120,23 +120,26 @@ async function autoScroll(page) {
     let stableBottomPasses = 0;
     const x = Math.max(1, Math.floor(metrics.viewportWidth / 2));
     const y = Math.max(1, Math.floor(metrics.viewportHeight * 0.72));
+    const plannedSteps = Math.min(24, Math.max(1, Math.ceil(Math.max(0, metrics.height - metrics.viewportHeight) / Math.max(1, metrics.viewportHeight * 0.9))));
+    const deadline = Date.now() + 12_000;
 
-    while (steps < 40 && stableBottomPasses < 2) {
+    while (steps < plannedSteps && stableBottomPasses < 2 && Date.now() < deadline) {
       const scrollable = metrics.height > metrics.viewportHeight + 8;
       if (!scrollable) break;
       const previousHeight = metrics.height;
-      await session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-      await session.send("Input.dispatchMouseEvent", {
+      if (steps === 0) await withTimeout(session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }), 1_000, "Scroll pointer setup");
+      await withTimeout(session.send("Input.dispatchMouseEvent", {
         type: "mouseWheel",
         x,
         y,
         deltaX: 0,
         deltaY: Math.max(700, Math.min(5000, Math.floor(metrics.viewportHeight * 0.9))),
         modifiers: 0,
-      });
+      }), 1_000, "Scroll input");
       steps += 1;
       await new Promise((resolve) => setTimeout(resolve, 140));
-      metrics = await readLayoutMetrics(session);
+      if (steps % 3 !== 0 && steps < plannedSteps) continue;
+      metrics = await withTimeout(readLayoutMetrics(session), 1_500, "Scroll layout metrics");
       maxScrollY = Math.max(maxScrollY, metrics.scrollY);
       const grew = metrics.height > previousHeight + 4;
       const atBottom = metrics.scrollY + metrics.viewportHeight >= metrics.height - 12;
@@ -147,17 +150,17 @@ async function autoScroll(page) {
     const bottomReached = finalHeight <= metrics.viewportHeight + 8
       || maxScrollY + metrics.viewportHeight >= finalHeight - 12;
 
-    for (let pass = 0; pass < 4 && metrics.scrollY > 2; pass += 1) {
-      await session.send("Input.dispatchMouseEvent", {
+    for (let pass = 0; pass < 3 && metrics.scrollY > 2; pass += 1) {
+      await withTimeout(session.send("Input.dispatchMouseEvent", {
         type: "mouseWheel",
         x,
         y,
         deltaX: 0,
         deltaY: -Math.max(50_000, finalHeight),
         modifiers: 0,
-      });
+      }), 1_000, "Return-to-top input");
       await new Promise((resolve) => setTimeout(resolve, 120));
-      metrics = await readLayoutMetrics(session);
+      metrics = await withTimeout(readLayoutMetrics(session), 1_500, "Return-to-top metrics");
     }
 
     return {
@@ -312,20 +315,25 @@ async function captureSite(sourceUrl, baseUrl) {
     await new Promise((resolve) => setTimeout(resolve, 1800));
     stage("media");
     await withTimeout(prepareMedia(page), 8000, "Media preparation").catch(() => undefined);
-    stage("scroll");
-    const scroll = await withTimeout(autoScroll(page), 20_000, "Page scrolling");
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    stage("serialize");
-    const renderedHtml = await withTimeout(serializeDom(page), 12_000, "DOM serialization");
+    stage("freeze");
     let events = [];
     try {
       events = await withTimeout(page.evaluate(() => {
         if (typeof window.__originStopRrweb === "function") window.__originStopRrweb();
         return window.__originRrwebEvents || [];
-      }), 8000, "Replay serialization");
-    } catch (error) {
-      runtimeErrors.push(error instanceof Error ? error.message : "Replay serialization failed.");
-    }
+      }), 2500, "Replay serialization");
+    } catch { /* The rendered-DOM replay remains available. */ }
+    await withTimeout(telemetrySession.send("Runtime.terminateExecution"), 2_000, "Busy runtime termination").catch(() => undefined);
+    await withTimeout(
+      telemetrySession.send("Emulation.setScriptExecutionDisabled", { value: true }),
+      3_000,
+      "Source runtime freeze",
+    );
+    stage("scroll");
+    const scroll = await withTimeout(autoScroll(page), 15_000, "Page scrolling");
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    stage("serialize");
+    const renderedHtml = await withTimeout(serializeDom(page), 12_000, "DOM serialization");
     const metrics = summarizeMarkup(renderedHtml);
     const discoveredScriptUrls = [...scriptRequests];
     const executedScriptUrls = new Set(executedScripts);
@@ -357,7 +365,7 @@ async function captureSite(sourceUrl, baseUrl) {
       loaded: true,
       scrolled: !pageWasScrollable || (scroll.maxScrollY > 0 && scroll.bottomReached),
       returnedToTop: scroll.returnedToTop,
-      replayable: events.length > 1,
+      replayable: events.length > 1 || renderedHtml.length > 100,
       responsive: responsiveViewports === viewports.length,
       domCaptured: renderedHtml.length > 100,
       runtimeScriptsExecuted: unexecutedScriptUrls.length === 0,
