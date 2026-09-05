@@ -21,6 +21,7 @@ let browserPromise;
 function getBrowser() {
   if (!browserPromise) {
     browserPromise = (async () => {
+      chromium.setGraphicsMode = false;
       const browser = await puppeteer.launch({
         args: await puppeteer.defaultArgs({ args: chromium.args, headless: "shell" }),
         defaultViewport: { width: 1440, height: 1000 },
@@ -221,7 +222,7 @@ async function captureSite(sourceUrl, baseUrl) {
     const verified = Object.values(checks).every(Boolean) && criticalFailures.length === 0 && runtimeErrors.length === 0;
     return {
       schemaVersion: "origin.capture/2",
-      provider: "origin-playwright-rrweb",
+      provider: "origin-puppeteer-rrweb",
       state: verified ? "verified" : "partial",
       sourceUrl: sourceUrl.toString(),
       replayUrl: `${baseUrl}/captures/${captureId}/replay`,
