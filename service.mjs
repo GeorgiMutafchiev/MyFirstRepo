@@ -97,73 +97,42 @@ async function withTimeout(promise, timeoutMs, label) {
 
 async function autoScroll(page) {
   const session = await page.createCDPSession();
-  const x = 720;
-  const y = 720;
-  let steps = 0;
+  const dispatchKey = async (key, code, virtualKeyCode, label) => {
+    try {
+      await withTimeout(session.send("Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key,
+        code,
+        windowsVirtualKeyCode: virtualKeyCode,
+        nativeVirtualKeyCode: virtualKeyCode,
+      }), 3_000, `${label} key down`);
+      await withTimeout(session.send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key,
+        code,
+        windowsVirtualKeyCode: virtualKeyCode,
+        nativeVirtualKeyCode: virtualKeyCode,
+      }), 3_000, `${label} key up`);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   try {
-    await withTimeout(session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }), 1_000, "Scroll pointer setup");
-    for (let pass = 0; pass < 3; pass += 1) {
-      await withTimeout(session.send("Input.dispatchKeyEvent", {
-        type: "keyDown",
-        key: "End",
-        code: "End",
-        windowsVirtualKeyCode: 35,
-        nativeVirtualKeyCode: 35,
-      }), 1_000, "End-key scroll");
-      await withTimeout(session.send("Input.dispatchKeyEvent", {
-        type: "keyUp",
-        key: "End",
-        code: "End",
-        windowsVirtualKeyCode: 35,
-        nativeVirtualKeyCode: 35,
-      }), 1_000, "End-key release");
-      await withTimeout(session.send("Input.dispatchMouseEvent", {
-        type: "mouseWheel",
-        x,
-        y,
-        deltaX: 0,
-        deltaY: 100_000,
-        modifiers: 0,
-      }), 1_000, "Bottom-boundary scroll");
-      steps += 1;
-      await new Promise((resolve) => setTimeout(resolve, 220));
-    }
-
-    for (let pass = 0; pass < 3; pass += 1) {
-      await withTimeout(session.send("Input.dispatchKeyEvent", {
-        type: "keyDown",
-        key: "Home",
-        code: "Home",
-        windowsVirtualKeyCode: 36,
-        nativeVirtualKeyCode: 36,
-      }), 1_000, "Home-key scroll");
-      await withTimeout(session.send("Input.dispatchKeyEvent", {
-        type: "keyUp",
-        key: "Home",
-        code: "Home",
-        windowsVirtualKeyCode: 36,
-        nativeVirtualKeyCode: 36,
-      }), 1_000, "Home-key release");
-      await withTimeout(session.send("Input.dispatchMouseEvent", {
-        type: "mouseWheel",
-        x,
-        y,
-        deltaX: 0,
-        deltaY: -100_000,
-        modifiers: 0,
-      }), 1_000, "Top-boundary scroll");
-      await new Promise((resolve) => setTimeout(resolve, 220));
-    }
-
+    const bottomReached = await dispatchKey("End", "End", 35, "Bottom-boundary");
+    if (bottomReached) await new Promise((resolve) => setTimeout(resolve, 500));
+    const returnedToTop = await dispatchKey("Home", "Home", 36, "Top-boundary");
+    if (returnedToTop) await new Promise((resolve) => setTimeout(resolve, 500));
     return {
       initialHeight: 0,
       finalHeight: 0,
       viewportHeight: 1000,
       maxScrollY: 0,
-      steps,
-      moved: true,
-      bottomReached: steps === 3,
-      returnedToTop: true,
+      steps: Number(bottomReached) + Number(returnedToTop),
+      moved: bottomReached,
+      bottomReached,
+      returnedToTop,
     };
   } finally {
     await session.detach().catch(() => undefined);
@@ -343,10 +312,9 @@ async function captureSite(sourceUrl, baseUrl) {
     }
     artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, renderedHtml, sourceUrl: sourceUrl.toString() });
     while (artifacts.size > MAX_RETAINED_CAPTURES) artifacts.delete(artifacts.keys().next().value);
-    const pageWasScrollable = scroll.moved;
     const checks = {
       loaded: true,
-      scrolled: !pageWasScrollable || scroll.bottomReached,
+      scrolled: scroll.bottomReached,
       returnedToTop: scroll.returnedToTop,
       replayable: events.length > 1 || renderedHtml.length > 100,
       responsive: responsiveViewports === viewports.length,
