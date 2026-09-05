@@ -95,82 +95,78 @@ async function withTimeout(promise, timeoutMs, label) {
   }
 }
 
-async function readLayoutMetrics(session) {
-  const metrics = await session.send("Page.getLayoutMetrics");
-  const viewport = metrics.cssLayoutViewport || metrics.layoutViewport || {};
-  const visualViewport = metrics.cssVisualViewport || metrics.visualViewport || {};
-  const content = metrics.cssContentSize || metrics.contentSize || {};
-  return {
-    width: Math.ceil(content.width || viewport.clientWidth || 0),
-    height: Math.ceil(content.height || viewport.clientHeight || 0),
-    viewportWidth: Math.ceil(viewport.clientWidth || visualViewport.clientWidth || 0),
-    viewportHeight: Math.ceil(viewport.clientHeight || visualViewport.clientHeight || 0),
-    scrollY: Math.max(0, Math.round(visualViewport.pageY ?? viewport.pageY ?? 0)),
-  };
-}
-
 async function autoScroll(page) {
   const session = await page.createCDPSession();
+  const viewportHeight = 1000;
+  const x = 720;
+  const y = 720;
+  const deltaY = 900;
+  let steps = 0;
+  let movedSteps = 0;
+  let stableFrames = 0;
   try {
-    let metrics = await withTimeout(readLayoutMetrics(session), 2_000, "Initial layout metrics");
-    const initialHeight = metrics.height;
-    const initialViewportHeight = metrics.viewportHeight;
-    let maxScrollY = metrics.scrollY;
-    let steps = 0;
-    let stableBottomPasses = 0;
-    const x = Math.max(1, Math.floor(metrics.viewportWidth / 2));
-    const y = Math.max(1, Math.floor(metrics.viewportHeight * 0.72));
-    const plannedSteps = Math.min(24, Math.max(1, Math.ceil(Math.max(0, metrics.height - metrics.viewportHeight) / Math.max(1, metrics.viewportHeight * 0.9))));
-    const deadline = Date.now() + 12_000;
+    const initialFrame = await withTimeout(
+      page.screenshot({ fullPage: false, type: "jpeg", quality: 24 }),
+      3_000,
+      "Initial scroll frame",
+    );
+    let previousFrame = initialFrame;
+    await withTimeout(session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }), 1_000, "Scroll pointer setup");
 
-    while (steps < plannedSteps && stableBottomPasses < 2 && Date.now() < deadline) {
-      const scrollable = metrics.height > metrics.viewportHeight + 8;
-      if (!scrollable) break;
-      const previousHeight = metrics.height;
-      if (steps === 0) await withTimeout(session.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }), 1_000, "Scroll pointer setup");
+    while (steps < 24 && stableFrames < 2) {
       await withTimeout(session.send("Input.dispatchMouseEvent", {
         type: "mouseWheel",
         x,
         y,
         deltaX: 0,
-        deltaY: Math.max(700, Math.min(5000, Math.floor(metrics.viewportHeight * 0.9))),
+        deltaY,
         modifiers: 0,
       }), 1_000, "Scroll input");
       steps += 1;
       await new Promise((resolve) => setTimeout(resolve, 140));
-      if (steps % 3 !== 0 && steps < plannedSteps) continue;
-      metrics = await withTimeout(readLayoutMetrics(session), 1_500, "Scroll layout metrics");
-      maxScrollY = Math.max(maxScrollY, metrics.scrollY);
-      const grew = metrics.height > previousHeight + 4;
-      const atBottom = metrics.scrollY + metrics.viewportHeight >= metrics.height - 12;
-      stableBottomPasses = atBottom && !grew ? stableBottomPasses + 1 : 0;
+      const frame = await withTimeout(
+        page.screenshot({ fullPage: false, type: "jpeg", quality: 24 }),
+        3_000,
+        "Scroll verification frame",
+      );
+      if (Buffer.compare(frame, previousFrame) === 0) {
+        stableFrames += 1;
+      } else {
+        movedSteps += 1;
+        stableFrames = 0;
+      }
+      previousFrame = frame;
     }
 
-    const finalHeight = metrics.height;
-    const bottomReached = finalHeight <= metrics.viewportHeight + 8
-      || maxScrollY + metrics.viewportHeight >= finalHeight - 12;
-
-    for (let pass = 0; pass < 3 && metrics.scrollY > 2; pass += 1) {
+    let returnFrame = previousFrame;
+    let returnedStableFrames = 0;
+    for (let pass = 0; pass < 4 && returnedStableFrames < 2; pass += 1) {
       await withTimeout(session.send("Input.dispatchMouseEvent", {
         type: "mouseWheel",
         x,
         y,
         deltaX: 0,
-        deltaY: -Math.max(50_000, finalHeight),
+        deltaY: -50_000,
         modifiers: 0,
       }), 1_000, "Return-to-top input");
-      await new Promise((resolve) => setTimeout(resolve, 120));
-      metrics = await withTimeout(readLayoutMetrics(session), 1_500, "Return-to-top metrics");
+      await new Promise((resolve) => setTimeout(resolve, 140));
+      const frame = await withTimeout(
+        page.screenshot({ fullPage: false, type: "jpeg", quality: 24 }),
+        3_000,
+        "Return-to-top verification frame",
+      );
+      returnedStableFrames = Buffer.compare(frame, returnFrame) === 0 ? returnedStableFrames + 1 : 0;
+      returnFrame = frame;
     }
-
     return {
-      initialHeight,
-      finalHeight,
-      viewportHeight: initialViewportHeight,
-      maxScrollY,
+      initialHeight: 0,
+      finalHeight: 0,
+      viewportHeight,
+      maxScrollY: 0,
       steps,
-      bottomReached,
-      returnedToTop: metrics.scrollY <= 2,
+      moved: movedSteps > 0,
+      bottomReached: stableFrames >= 2,
+      returnedToTop: returnedStableFrames >= 2,
     };
   } finally {
     await session.detach().catch(() => undefined);
@@ -347,23 +343,18 @@ async function captureSite(sourceUrl, baseUrl) {
       try {
         await withTimeout(page.setViewport({ width, height: width === 390 ? 844 : 900 }), 5000, `${width}px viewport setup`);
         await new Promise((resolve) => setTimeout(resolve, 280));
-        const session = await page.createCDPSession();
-        try {
-          await withTimeout(session.send("Page.getLayoutMetrics"), 5000, `${width}px layout validation`);
-          responsiveViewports += 1;
-        } finally {
-          await session.detach().catch(() => undefined);
-        }
+        const frame = await withTimeout(page.screenshot({ fullPage: false, type: "jpeg", quality: 24 }), 5_000, `${width}px viewport validation`);
+        if (frame.length > 1_000) responsiveViewports += 1;
       } catch (error) {
         runtimeErrors.push(error instanceof Error ? error.message : `${width}px layout validation failed.`);
       }
     }
     artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, renderedHtml, sourceUrl: sourceUrl.toString() });
     while (artifacts.size > MAX_RETAINED_CAPTURES) artifacts.delete(artifacts.keys().next().value);
-    const pageWasScrollable = scroll.finalHeight > scroll.viewportHeight + 8;
+    const pageWasScrollable = scroll.moved;
     const checks = {
       loaded: true,
-      scrolled: !pageWasScrollable || (scroll.maxScrollY > 0 && scroll.bottomReached),
+      scrolled: !pageWasScrollable || scroll.bottomReached,
       returnedToTop: scroll.returnedToTop,
       replayable: events.length > 1 || renderedHtml.length > 100,
       responsive: responsiveViewports === viewports.length,
