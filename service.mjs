@@ -105,6 +105,10 @@ async function prepareMedia(page) {
 }
 
 async function captureSite(sourceUrl, baseUrl) {
+  const captureId = randomUUID();
+  const startedAt = Date.now();
+  const stage = (name) => console.log(JSON.stringify({ captureId, stage: name, elapsedMs: Date.now() - startedAt }));
+  stage("browser");
   const browser = await getBrowser();
   const page = await browser.newPage();
   await page.setRequestInterception(true);
@@ -130,21 +134,38 @@ async function captureSite(sourceUrl, baseUrl) {
     } catch { /* Non-HTTP browser-internal request. */ }
   });
   try {
+    stage("instrument");
     await page.evaluateOnNewDocument(rrwebScript);
     await page.evaluateOnNewDocument(() => {
       window.__originRrwebEvents = [];
       window.addEventListener("DOMContentLoaded", () => {
-        if (window.rrweb?.record) window.rrweb.record({ emit(event) { window.__originRrwebEvents.push(event); }, recordCanvas: true, collectFonts: true });
+        if (window.rrweb?.record) {
+          window.__originStopRrweb = window.rrweb.record({
+            emit(event) {
+              if (window.__originRrwebEvents.length < 5000) window.__originRrwebEvents.push(event);
+            },
+            recordCanvas: false,
+            collectFonts: false,
+            checkoutEveryNms: 5000,
+          });
+        }
       }, { once: true });
     });
+    stage("navigate");
     const response = await page.goto(sourceUrl.toString(), { waitUntil: "domcontentloaded", timeout: 30_000 });
     if (!response || response.status() >= 400) throw new Error(`The browser navigation returned HTTP ${response?.status() || "unknown"}.`);
     await new Promise((resolve) => setTimeout(resolve, 1800));
+    stage("media");
     await prepareMedia(page);
+    stage("scroll");
     const scrollHeight = await autoScroll(page);
     await new Promise((resolve) => setTimeout(resolve, 800));
+    stage("serialize");
     const renderedHtml = await page.evaluate(() => `<!doctype html>\n${document.documentElement.outerHTML}`);
-    const events = await page.evaluate(() => window.__originRrwebEvents || []);
+    const events = await page.evaluate(() => {
+      if (typeof window.__originStopRrweb === "function") window.__originStopRrweb();
+      return window.__originRrwebEvents || [];
+    });
     const metrics = await page.evaluate(() => ({
       elements: document.querySelectorAll("*").length,
       stylesheets: document.styleSheets.length,
@@ -155,8 +176,10 @@ async function captureSite(sourceUrl, baseUrl) {
       customElements: [...document.querySelectorAll("*")].filter((element) => element.localName.includes("-")).length,
       interactiveSignals: document.querySelectorAll("button,a,input,select,textarea,[role='button'],[aria-expanded],[data-animation],[class*='carousel'],[class*='slider']").length,
     }));
-    const screenshot = await page.screenshot({ fullPage: true, type: "jpeg", quality: 78 });
+    stage("screenshot");
+    const screenshot = await page.screenshot({ fullPage: scrollHeight <= 24_000, type: "jpeg", quality: 72 });
     const viewports = [1440, 1024, 768, 390];
+    stage("responsive");
     for (const width of viewports.slice(1)) {
       await page.setViewport({ width, height: width === 390 ? 844 : 900 });
       await new Promise((resolve) => setTimeout(resolve, 280));
@@ -167,8 +190,7 @@ async function captureSite(sourceUrl, baseUrl) {
         root.scrollTo({ top: 0, behavior: "instant" });
       });
     }
-    const id = randomUUID();
-    artifacts.set(id, { createdAt: Date.now(), screenshot, events, sourceUrl: sourceUrl.toString() });
+    artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, sourceUrl: sourceUrl.toString() });
     const checks = {
       loaded: true,
       scrolled: scrollHeight > 0,
@@ -182,8 +204,8 @@ async function captureSite(sourceUrl, baseUrl) {
       provider: "origin-playwright-rrweb",
       state: verified ? "verified" : "partial",
       sourceUrl: sourceUrl.toString(),
-      replayUrl: `${baseUrl}/captures/${id}/replay`,
-      screenshotUrl: `${baseUrl}/captures/${id}/screenshot.jpg`,
+      replayUrl: `${baseUrl}/captures/${captureId}/replay`,
+      screenshotUrl: `${baseUrl}/captures/${captureId}/screenshot.jpg`,
       capturedAt: new Date().toISOString(),
       renderedHtml,
       checks,
@@ -199,6 +221,7 @@ async function captureSite(sourceUrl, baseUrl) {
       blockers: [...runtimeErrors.slice(0, 5), ...criticalFailures.slice(0, 10)],
     };
   } finally {
+    stage("cleanup");
     await page.close().catch(() => undefined);
   }
 }
