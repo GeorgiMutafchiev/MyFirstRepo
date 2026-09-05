@@ -211,7 +211,7 @@ async function captureSite(sourceUrl, baseUrl) {
         await session.detach().catch(() => undefined);
       }
     }
-    artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, sourceUrl: sourceUrl.toString() });
+    artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, renderedHtml, sourceUrl: sourceUrl.toString() });
     const checks = {
       loaded: true,
       scrolled: scrollHeight > 0,
@@ -248,6 +248,10 @@ async function captureSite(sourceUrl, baseUrl) {
 }
 
 function replayDocument(artifact) {
+  if (artifact.events.length < 2) {
+    const base = `<base href="${artifact.sourceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">`;
+    return artifact.renderedHtml.replace(/<head([^>]*)>/i, `<head$1>${base}`);
+  }
   const events = JSON.stringify(artifact.events).replace(/</g, "\\u003c");
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rrweb-player@1.0.0-alpha.4/dist/style.css"><style>html,body,#replay{height:100%;margin:0;background:#fff}.rr-player{width:100%!important;height:100%!important}.rr-player__frame{width:100%!important;height:calc(100% - 80px)!important}</style></head><body><div id="replay"></div><script src="https://cdn.jsdelivr.net/npm/rrweb-player@1.0.0-alpha.4/dist/index.js"></script><script>new rrwebPlayer({target:document.getElementById('replay'),props:{events:${events},autoPlay:true,showController:true,width:1440,height:900}})</script></body></html>`;
 }
@@ -268,7 +272,10 @@ const server = http.createServer(async (request, response) => {
         response.writeHead(200, { "content-type": "image/jpeg", "cache-control": "private, max-age=1800" });
         return response.end(artifact.screenshot);
       }
-      response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'self' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src * data: blob:; media-src * data: blob:; font-src * data:", "cache-control": "private, max-age=1800" });
+      const contentSecurityPolicy = artifact.events.length > 1
+        ? "default-src 'self' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src * data: blob:; media-src * data: blob:; font-src * data:"
+        : "default-src 'none'; script-src 'none'; style-src 'unsafe-inline' https:; img-src data: blob: https:; media-src data: blob: https:; font-src data: https:; frame-src https:; form-action 'none'; base-uri https:";
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": contentSecurityPolicy, "cache-control": "private, max-age=1800" });
       return response.end(replayDocument(artifact));
     }
     if (request.method !== "POST" || request.url !== "/capture") return json(response, 404, { error: "Not found." });
