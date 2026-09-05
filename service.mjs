@@ -83,29 +83,30 @@ async function withTimeout(promise, timeoutMs, label) {
 }
 
 async function autoScroll(page) {
-  let previousHeight = 0;
-  let stablePasses = 0;
-  let scrollHeight = 0;
-  for (let pass = 0; pass < 18 && stablePasses < 2; pass += 1) {
+  for (let pass = 0; pass < 18; pass += 1) {
     await page.mouse.wheel({ deltaY: 4500 });
     await new Promise((resolve) => setTimeout(resolve, 100));
-    if (pass % 3 !== 2) continue;
-    const position = await withTimeout(page.evaluate(() => {
-      const root = document.scrollingElement || document.documentElement;
-      return {
-        top: root.scrollTop,
-        height: Math.max(root.scrollHeight, document.body?.scrollHeight || 0),
-        viewport: innerHeight,
-      };
-    }), 3000, "Scroll measurement");
-    scrollHeight = position.height;
-    if (position.top + position.viewport >= position.height - 4 && position.height === previousHeight) stablePasses += 1;
-    else stablePasses = 0;
-    previousHeight = position.height;
   }
   await page.keyboard.press("Home");
   await new Promise((resolve) => setTimeout(resolve, 300));
-  return scrollHeight || previousHeight;
+  const session = await page.createCDPSession();
+  try {
+    const metrics = await session.send("Page.getLayoutMetrics");
+    return Math.ceil(metrics.cssContentSize?.height || metrics.contentSize?.height || 0);
+  } finally {
+    await session.detach().catch(() => undefined);
+  }
+}
+
+async function serializeDom(page) {
+  const session = await page.createCDPSession();
+  try {
+    const { root } = await session.send("DOM.getDocument", { depth: 1, pierce: true });
+    const { outerHTML } = await session.send("DOM.getOuterHTML", { nodeId: root.nodeId });
+    return `<!doctype html>\n${outerHTML}`;
+  } finally {
+    await session.detach().catch(() => undefined);
+  }
 }
 
 async function prepareMedia(page) {
@@ -180,11 +181,16 @@ async function captureSite(sourceUrl, baseUrl) {
     const scrollHeight = await withTimeout(autoScroll(page), 20_000, "Page scrolling");
     await new Promise((resolve) => setTimeout(resolve, 800));
     stage("serialize");
-    const renderedHtml = await withTimeout(page.evaluate(() => `<!doctype html>\n${document.documentElement.outerHTML}`), 12_000, "DOM serialization");
-    const events = await withTimeout(page.evaluate(() => {
-      if (typeof window.__originStopRrweb === "function") window.__originStopRrweb();
-      return window.__originRrwebEvents || [];
-    }), 12_000, "Replay serialization");
+    const renderedHtml = await withTimeout(serializeDom(page), 12_000, "DOM serialization");
+    let events = [];
+    try {
+      events = await withTimeout(page.evaluate(() => {
+        if (typeof window.__originStopRrweb === "function") window.__originStopRrweb();
+        return window.__originRrwebEvents || [];
+      }), 8000, "Replay serialization");
+    } catch (error) {
+      runtimeErrors.push(error instanceof Error ? error.message : "Replay serialization failed.");
+    }
     const metrics = await page.evaluate(() => ({
       elements: document.querySelectorAll("*").length,
       stylesheets: document.styleSheets.length,
