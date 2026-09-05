@@ -13,9 +13,31 @@ const PORT = Number(process.env.PORT || 10000);
 const TOKEN = process.env.ORIGIN_CAPTURE_TOKEN || "";
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
 const MAX_BODY_BYTES = 64_000;
-const MAX_CAPTURE_MS = 50_000;
+const MAX_CAPTURE_MS = 120_000;
 const ARTIFACT_TTL_MS = 30 * 60_000;
 const artifacts = new Map();
+let browserPromise;
+
+function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = (async () => {
+      chromium.setGraphicsMode = false;
+      const browser = await puppeteer.launch({
+        args: await puppeteer.defaultArgs({ args: chromium.args, headless: "shell" }),
+        defaultViewport: { width: 1440, height: 1000 },
+        executablePath: await chromium.executablePath(),
+        headless: "shell",
+        timeout: 90_000,
+      });
+      browser.once("disconnected", () => { browserPromise = undefined; });
+      return browser;
+    })().catch((error) => {
+      browserPromise = undefined;
+      throw error;
+    });
+  }
+  return browserPromise;
+}
 
 function json(response, status, body) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -83,14 +105,9 @@ async function prepareMedia(page) {
 }
 
 async function captureSite(sourceUrl, baseUrl) {
-  chromium.setGraphicsMode = false;
-  const browser = await puppeteer.launch({
-    args: await puppeteer.defaultArgs({ args: chromium.args, headless: "shell" }),
-    defaultViewport: { width: 1440, height: 1000 },
-    executablePath: await chromium.executablePath(),
-    headless: "shell",
-  });
-  const page = await browser.newPage();
+  const browser = await getBrowser();
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
   await page.setRequestInterception(true);
   page.on("request", async (request) => {
     if (!request.isNavigationRequest() || request.resourceType() !== "document") return request.continue();
@@ -183,7 +200,7 @@ async function captureSite(sourceUrl, baseUrl) {
       blockers: [...runtimeErrors.slice(0, 5), ...criticalFailures.slice(0, 10)],
     };
   } finally {
-    await browser.close().catch(() => undefined);
+    await context.close().catch(() => undefined);
   }
 }
 
@@ -229,4 +246,7 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-server.listen(PORT, "0.0.0.0", () => console.log(`Origin capture worker listening on ${PORT}`));
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Origin capture worker listening on ${PORT}`);
+  getBrowser().then(() => console.log("Origin capture browser ready")).catch((error) => console.error("Origin capture browser failed", error));
+});
