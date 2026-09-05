@@ -206,7 +206,7 @@ function absolutizeCssUrls(source, sourceUrl) {
   });
 }
 
-async function captureLoadedCss(session, stylesheetHeaders) {
+async function captureLoadedCss(session, stylesheetHeaders, stylesheetBodies) {
   const headers = [...stylesheetHeaders.values()].filter((header) => header.sourceURL).slice(0, 48);
   const results = await Promise.all(headers.map(async (header) => {
     try {
@@ -215,18 +215,22 @@ async function captureLoadedCss(session, stylesheetHeaders) {
         2_500,
         "Stylesheet capture",
       );
-      return absolutizeCssUrls(result.text || "", header.sourceURL);
+      return { sourceUrl: header.sourceURL, text: result.text || "" };
     } catch {
-      return "";
+      return null;
     }
   }));
+  const stylesheetTexts = new Map(stylesheetBodies);
+  for (const result of results) {
+    if (result?.text && !stylesheetTexts.has(result.sourceUrl)) stylesheetTexts.set(result.sourceUrl, result.text);
+  }
   let capturedCss = "";
   let stylesheetsCaptured = 0;
-  for (const result of results) {
-    if (!result) continue;
+  for (const [sourceUrl, stylesheetText] of stylesheetTexts) {
+    if (!stylesheetText) continue;
     const remaining = 1_500_000 - capturedCss.length;
     if (remaining <= 0) break;
-    capturedCss += `${result.slice(0, remaining)}\n`;
+    capturedCss += `${absolutizeCssUrls(stylesheetText, sourceUrl).slice(0, remaining)}\n`;
     stylesheetsCaptured += 1;
   }
   return { capturedCss, stylesheetsCaptured };
@@ -246,6 +250,8 @@ async function captureSite(sourceUrl, baseUrl) {
   const executedScripts = new Set();
   const animations = new Map();
   const stylesheetHeaders = new Map();
+  const stylesheetBodies = new Map();
+  const stylesheetCaptures = new Set();
   let networkRequests = 0;
 
   telemetrySession.on("Debugger.scriptParsed", (event) => {
@@ -290,6 +296,17 @@ async function captureSite(sourceUrl, baseUrl) {
     }
   });
   page.on("pageerror", (error) => runtimeErrors.push(String(error.message || error)));
+  page.on("response", (response) => {
+    if (response.request().resourceType() !== "stylesheet" || stylesheetBodies.size + stylesheetCaptures.size >= 48) return;
+    const sourceUrl = response.url();
+    const capture = withTimeout(response.text(), 4_000, "Stylesheet response capture")
+      .then((text) => {
+        if (text && !stylesheetBodies.has(sourceUrl)) stylesheetBodies.set(sourceUrl, text);
+      })
+      .catch(() => undefined)
+      .finally(() => stylesheetCaptures.delete(capture));
+    stylesheetCaptures.add(capture);
+  });
   page.on("requestfailed", (request) => {
     const type = request.resourceType();
     try {
@@ -322,7 +339,17 @@ async function captureSite(sourceUrl, baseUrl) {
     stage("media");
     await withTimeout(prepareMedia(page), 8000, "Media preparation").catch(() => undefined);
     stage("styles");
-    const { capturedCss, stylesheetsCaptured } = await captureLoadedCss(telemetrySession, stylesheetHeaders);
+    await withTimeout(Promise.allSettled([...stylesheetCaptures]), 6_000, "Stylesheet response drain").catch(() => undefined);
+    const { capturedCss, stylesheetsCaptured } = await captureLoadedCss(telemetrySession, stylesheetHeaders, stylesheetBodies);
+    console.log(JSON.stringify({
+      captureId,
+      stage: "styles-complete",
+      elapsedMs: Date.now() - startedAt,
+      headers: stylesheetHeaders.size,
+      responses: stylesheetBodies.size,
+      stylesheetsCaptured,
+      cssBytes: Buffer.byteLength(capturedCss),
+    }));
     stage("replay");
     let events = [];
     try {
