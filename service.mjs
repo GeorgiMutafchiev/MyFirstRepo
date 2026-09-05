@@ -21,7 +21,6 @@ let browserPromise;
 function getBrowser() {
   if (!browserPromise) {
     browserPromise = (async () => {
-      chromium.setGraphicsMode = false;
       const browser = await puppeteer.launch({
         args: await puppeteer.defaultArgs({ args: chromium.args, headless: "shell" }),
         defaultViewport: { width: 1440, height: 1000 },
