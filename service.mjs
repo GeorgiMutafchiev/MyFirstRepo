@@ -200,15 +200,21 @@ async function captureSite(sourceUrl, baseUrl) {
     stage("screenshot");
     const screenshot = await withTimeout(page.screenshot({ fullPage: false, type: "jpeg", quality: 68 }), 12_000, "Screenshot capture");
     const viewports = [1440, 1024, 768, 390];
+    let responsiveViewports = 1;
     stage("responsive");
     for (const width of viewports.slice(1)) {
-      await page.setViewport({ width, height: width === 390 ? 844 : 900 });
-      await new Promise((resolve) => setTimeout(resolve, 280));
-      const session = await page.createCDPSession();
       try {
-        await withTimeout(session.send("Page.getLayoutMetrics"), 5000, `${width}px layout validation`);
-      } finally {
-        await session.detach().catch(() => undefined);
+        await withTimeout(page.setViewport({ width, height: width === 390 ? 844 : 900 }), 5000, `${width}px viewport setup`);
+        await new Promise((resolve) => setTimeout(resolve, 280));
+        const session = await page.createCDPSession();
+        try {
+          await withTimeout(session.send("Page.getLayoutMetrics"), 5000, `${width}px layout validation`);
+          responsiveViewports += 1;
+        } finally {
+          await session.detach().catch(() => undefined);
+        }
+      } catch (error) {
+        runtimeErrors.push(error instanceof Error ? error.message : `${width}px layout validation failed.`);
       }
     }
     artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, renderedHtml, sourceUrl: sourceUrl.toString() });
@@ -216,7 +222,7 @@ async function captureSite(sourceUrl, baseUrl) {
       loaded: true,
       scrolled: scrollHeight > 0,
       replayable: events.length > 1,
-      responsive: viewports.length === 4,
+      responsive: responsiveViewports === viewports.length,
       domCaptured: renderedHtml.length > 100,
     };
     const verified = Object.values(checks).every(Boolean) && criticalFailures.length === 0 && runtimeErrors.length === 0;
@@ -233,7 +239,7 @@ async function captureSite(sourceUrl, baseUrl) {
       evidence: {
         htmlBytes: Buffer.byteLength(renderedHtml),
         ...metrics,
-        viewports: viewports.length,
+        viewports: responsiveViewports,
         scrollHeight,
         networkRequests,
         criticalNetworkFailures: criticalFailures.length,
