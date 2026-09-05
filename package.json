@@ -9,7 +9,8 @@
     "check": "node --check service.mjs"
   },
   "dependencies": {
-    "playwright": "1.55.0",
+    "@sparticuz/chromium": "149.0.0",
+    "puppeteer-core": "25.10.0",
     "rrweb": "1.1.3"
   }
 }
