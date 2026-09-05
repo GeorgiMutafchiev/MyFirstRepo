@@ -12,6 +12,7 @@ const rrwebScript = readFileSync(rrwebScriptPath, "utf8");
 const PORT = Number(process.env.PORT || 10000);
 const TOKEN = process.env.ORIGIN_CAPTURE_TOKEN || "";
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
+const SMOKE_URL = process.env.ORIGIN_CAPTURE_SMOKE_URL?.trim() || "";
 const MAX_BODY_BYTES = 64_000;
 const MAX_CAPTURE_MS = 120_000;
 const ARTIFACT_TTL_MS = 30 * 60_000;
@@ -453,6 +454,43 @@ function enqueueCapture(sourceUrl, baseUrl) {
   return jobId;
 }
 
+async function runSmokeCapture(rawUrl) {
+  const baseUrl = `http://127.0.0.1:${PORT}`;
+  const headers = {
+    "content-type": "application/json",
+    ...(TOKEN ? { authorization: `Bearer ${TOKEN}` } : {}),
+  };
+  const startResponse = await fetch(`${baseUrl}/capture/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ schemaVersion: "origin.capture/2", url: rawUrl }),
+  });
+  const started = await startResponse.json();
+  if (startResponse.status !== 202 || typeof started.jobId !== "string") {
+    throw new Error(started.error || `Smoke capture start returned HTTP ${startResponse.status}.`);
+  }
+  console.log(JSON.stringify({ jobId: started.jobId, stage: "smoke-start", sourceUrl: rawUrl }));
+  const deadline = Date.now() + MAX_CAPTURE_MS + 15_000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const pollResponse = await fetch(`${baseUrl}/capture/jobs/${encodeURIComponent(started.jobId)}`, { headers });
+    const job = await pollResponse.json();
+    if (pollResponse.status === 202) continue;
+    if (!pollResponse.ok || job.state !== "complete") throw new Error(job.error || `Smoke capture returned HTTP ${pollResponse.status}.`);
+    console.log(JSON.stringify({
+      jobId: started.jobId,
+      stage: "smoke-complete",
+      sourceUrl: rawUrl,
+      state: job.artifact?.state,
+      checks: job.artifact?.checks,
+      evidence: job.artifact?.evidence,
+      blockers: job.artifact?.blockers,
+    }));
+    return;
+  }
+  throw new Error("Smoke capture timed out.");
+}
+
 setInterval(() => {
   const artifactCutoff = Date.now() - ARTIFACT_TTL_MS;
   const jobCutoff = Date.now() - JOB_TTL_MS;
@@ -511,5 +549,10 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Origin capture worker listening on ${PORT}`);
-  getBrowser().then(() => console.log("Origin capture browser ready")).catch((error) => console.error("Origin capture browser failed", error));
+  getBrowser().then(() => {
+    console.log("Origin capture browser ready");
+    if (SMOKE_URL) runSmokeCapture(SMOKE_URL).catch((error) => {
+      console.error(JSON.stringify({ stage: "smoke-failed", sourceUrl: SMOKE_URL, error: error instanceof Error ? error.message : "Smoke capture failed." }));
+    });
+  }).catch((error) => console.error("Origin capture browser failed", error));
 });
