@@ -2,10 +2,13 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { promises as dns } from "node:dns";
 import { createRequire } from "node:module";
-import { chromium } from "playwright";
+import { readFileSync } from "node:fs";
+import puppeteer from "puppeteer-core";
+import chromium from "@sparticuz/chromium";
 
 const require = createRequire(import.meta.url);
 const rrwebScriptPath = require.resolve("rrweb/dist/rrweb.min.js");
+const rrwebScript = readFileSync(rrwebScriptPath, "utf8");
 const PORT = Number(process.env.PORT || 10000);
 const TOKEN = process.env.ORIGIN_CAPTURE_TOKEN || "";
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
@@ -80,19 +83,24 @@ async function prepareMedia(page) {
 }
 
 async function captureSite(sourceUrl, baseUrl) {
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: "no-preference" });
-  await context.route("**/*", async (route) => {
-    const request = route.request();
-    if (!request.isNavigationRequest() || request.resourceType() !== "document") return route.continue();
+  chromium.setGraphicsMode = false;
+  const browser = await puppeteer.launch({
+    args: await puppeteer.defaultArgs({ args: chromium.args, headless: "shell" }),
+    defaultViewport: { width: 1440, height: 1000 },
+    executablePath: await chromium.executablePath(),
+    headless: "shell",
+  });
+  const page = await browser.newPage();
+  await page.setRequestInterception(true);
+  page.on("request", async (request) => {
+    if (!request.isNavigationRequest() || request.resourceType() !== "document") return request.continue();
     try {
       await validateTarget(request.url());
-      return route.continue();
+      return request.continue();
     } catch {
-      return route.abort("blockedbyclient");
+      return request.abort("blockedbyclient");
     }
   });
-  const page = await context.newPage();
   const runtimeErrors = [];
   const criticalFailures = [];
   let networkRequests = 0;
@@ -106,8 +114,8 @@ async function captureSite(sourceUrl, baseUrl) {
     } catch { /* Non-HTTP browser-internal request. */ }
   });
   try {
-    await page.addInitScript({ path: rrwebScriptPath });
-    await page.addInitScript(() => {
+    await page.evaluateOnNewDocument(rrwebScript);
+    await page.evaluateOnNewDocument(() => {
       window.__originRrwebEvents = [];
       window.addEventListener("DOMContentLoaded", () => {
         if (window.rrweb?.record) window.rrweb.record({ emit(event) { window.__originRrwebEvents.push(event); }, recordCanvas: true, collectFonts: true });
@@ -115,10 +123,10 @@ async function captureSite(sourceUrl, baseUrl) {
     });
     const response = await page.goto(sourceUrl.toString(), { waitUntil: "domcontentloaded", timeout: 30_000 });
     if (!response || response.status() >= 400) throw new Error(`The browser navigation returned HTTP ${response?.status() || "unknown"}.`);
-    await page.waitForTimeout(1800);
+    await new Promise((resolve) => setTimeout(resolve, 1800));
     await prepareMedia(page);
     const scrollHeight = await autoScroll(page);
-    await page.waitForTimeout(800);
+    await new Promise((resolve) => setTimeout(resolve, 800));
     const renderedHtml = await page.evaluate(() => `<!doctype html>\n${document.documentElement.outerHTML}`);
     const events = await page.evaluate(() => window.__originRrwebEvents || []);
     const metrics = await page.evaluate(() => ({
@@ -134,8 +142,8 @@ async function captureSite(sourceUrl, baseUrl) {
     const screenshot = await page.screenshot({ fullPage: true, type: "jpeg", quality: 78 });
     const viewports = [1440, 1024, 768, 390];
     for (const width of viewports.slice(1)) {
-      await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
-      await page.waitForTimeout(280);
+      await page.setViewport({ width, height: width === 390 ? 844 : 900 });
+      await new Promise((resolve) => setTimeout(resolve, 280));
       await page.evaluate(async () => {
         const root = document.scrollingElement || document.documentElement;
         root.scrollTo({ top: root.scrollHeight, behavior: "instant" });
@@ -175,7 +183,6 @@ async function captureSite(sourceUrl, baseUrl) {
       blockers: [...runtimeErrors.slice(0, 5), ...criticalFailures.slice(0, 10)],
     };
   } finally {
-    await context.close().catch(() => undefined);
     await browser.close().catch(() => undefined);
   }
 }
