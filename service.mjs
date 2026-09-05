@@ -83,9 +83,9 @@ async function withTimeout(promise, timeoutMs, label) {
 }
 
 async function autoScroll(page) {
-  for (let pass = 0; pass < 18; pass += 1) {
-    await page.mouse.wheel({ deltaY: 4500 });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+  for (let pass = 0; pass < 6; pass += 1) {
+    await page.mouse.wheel({ deltaY: 15_000 });
+    await new Promise((resolve) => setTimeout(resolve, 120));
   }
   await page.keyboard.press("Home");
   await new Promise((resolve) => setTimeout(resolve, 300));
