@@ -1,14 +1,9 @@
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { promises as dns } from "node:dns";
-import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
 import puppeteer from "puppeteer-core";
 import chromium from "@sparticuz/chromium";
 
-const require = createRequire(import.meta.url);
-const rrwebScriptPath = require.resolve("rrweb/dist/rrweb.min.js");
-const rrwebScript = readFileSync(rrwebScriptPath, "utf8");
 const PORT = Number(process.env.PORT || 10000);
 const TOKEN = process.env.ORIGIN_CAPTURE_TOKEN || "";
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
@@ -27,7 +22,7 @@ let captureQueue = Promise.resolve();
 function getBrowser() {
   if (!browserPromise) {
     browserPromise = (async () => {
-      chromium.setGraphicsMode = false;
+      chromium.setGraphicsMode = true;
       const browser = await puppeteer.launch({
         args: await puppeteer.defaultArgs({ args: chromium.args, headless: "shell" }),
         defaultViewport: { width: 1440, height: 1000 },
@@ -95,48 +90,124 @@ async function withTimeout(promise, timeoutMs, label) {
   }
 }
 
+async function waitForNetworkQuiet(activeRequests, timeoutMs = 12_000) {
+  const startedAt = Date.now();
+  let quietSince = 0;
+  while (Date.now() - startedAt < timeoutMs) {
+    if (activeRequests() <= 2) {
+      if (!quietSince) quietSince = Date.now();
+      if (Date.now() - quietSince >= 1_000) return true;
+    } else {
+      quietSince = 0;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return false;
+}
+
 async function autoScroll(page) {
   const session = await page.createCDPSession();
-  const dispatchKey = async (key, code, virtualKeyCode, label) => {
+  const layout = async () => {
     try {
-      await withTimeout(session.send("Input.dispatchKeyEvent", {
-        type: "keyDown",
-        key,
-        code,
-        windowsVirtualKeyCode: virtualKeyCode,
-        nativeVirtualKeyCode: virtualKeyCode,
-      }), 3_000, `${label} key down`);
-      await withTimeout(session.send("Input.dispatchKeyEvent", {
-        type: "keyUp",
-        key,
-        code,
-        windowsVirtualKeyCode: virtualKeyCode,
-        nativeVirtualKeyCode: virtualKeyCode,
-      }), 3_000, `${label} key up`);
-      return true;
+      const metrics = await withTimeout(session.send("Page.getLayoutMetrics"), 2_000, "Layout metrics");
+      const viewport = metrics.cssVisualViewport || metrics.visualViewport || {};
+      const content = metrics.cssContentSize || metrics.contentSize || {};
+      return {
+        pageY: Math.max(0, Number(viewport.pageY) || 0),
+        viewportHeight: Math.max(1, Number(viewport.clientHeight) || 1000),
+        contentHeight: Math.max(1, Number(content.height) || 1000),
+      };
     } catch {
-      return false;
+      return null;
     }
   };
+  const wheel = async (deltaY) => withTimeout(session.send("Input.dispatchMouseEvent", {
+    type: "mouseWheel",
+    x: 720,
+    y: 720,
+    deltaX: 0,
+    deltaY,
+  }), 2_000, "Browser wheel scroll").then(() => true).catch(() => false);
 
   try {
-    const bottomReached = await dispatchKey("End", "End", 35, "Bottom-boundary");
-    if (bottomReached) await new Promise((resolve) => setTimeout(resolve, 500));
-    const returnedToTop = await dispatchKey("Home", "Home", 36, "Top-boundary");
-    if (returnedToTop) await new Promise((resolve) => setTimeout(resolve, 500));
+    const initial = await layout();
+    let current = initial;
+    let maxScrollY = current?.pageY || 0;
+    let steps = 0;
+    for (let index = 0; index < 12; index += 1) {
+      const remaining = current ? Math.max(0, current.contentHeight - current.viewportHeight - current.pageY) : 1_100;
+      if (current && remaining <= 8) break;
+      if (!await wheel(Math.max(700, Math.min(1_250, remaining)))) break;
+      steps += 1;
+      await new Promise((resolve) => setTimeout(resolve, 320));
+      current = await layout() || current;
+      maxScrollY = Math.max(maxScrollY, current?.pageY || 0);
+    }
+    const final = await layout() || current;
+    const bottomReached = Boolean(final && final.contentHeight - final.viewportHeight - final.pageY <= 16);
+    for (let index = 0; index < Math.max(1, steps); index += 1) {
+      if (!await wheel(-1_250)) break;
+      await new Promise((resolve) => setTimeout(resolve, 180));
+    }
+    await withTimeout(session.send("Input.dispatchKeyEvent", {
+      type: "keyDown", key: "Home", code: "Home", windowsVirtualKeyCode: 36, nativeVirtualKeyCode: 36,
+    }), 1_500, "Top-boundary key down").catch(() => undefined);
+    await withTimeout(session.send("Input.dispatchKeyEvent", {
+      type: "keyUp", key: "Home", code: "Home", windowsVirtualKeyCode: 36, nativeVirtualKeyCode: 36,
+    }), 1_500, "Top-boundary key up").catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const returned = await layout();
+    const returnedToTop = Boolean(returned && returned.pageY <= 8);
     return {
-      initialHeight: 0,
-      finalHeight: 0,
-      viewportHeight: 1000,
-      maxScrollY: 0,
-      steps: Number(bottomReached) + Number(returnedToTop),
-      moved: bottomReached,
+      initialHeight: initial?.contentHeight || 0,
+      finalHeight: final?.contentHeight || 0,
+      viewportHeight: final?.viewportHeight || initial?.viewportHeight || 1000,
+      maxScrollY,
+      steps,
+      moved: maxScrollY > 8,
       bottomReached,
       returnedToTop,
     };
   } finally {
     await session.detach().catch(() => undefined);
   }
+}
+
+async function startVisualRecorder(page) {
+  const session = await page.createCDPSession();
+  const frames = [];
+  let firstFrameAt = 0;
+  let lastFrameAt = 0;
+  let lastAcceptedAt = 0;
+  const onFrame = (event) => {
+    session.send("Page.screencastFrameAck", { sessionId: event.sessionId }).catch(() => undefined);
+    const now = Date.now();
+    if (frames.length >= 18 || now - lastAcceptedAt < 280) return;
+    const frame = Buffer.from(event.data || "", "base64");
+    if (frame.length < 1_000) return;
+    frames.push(frame);
+    firstFrameAt ||= now;
+    lastFrameAt = now;
+    lastAcceptedAt = now;
+  };
+  session.on("Page.screencastFrame", onFrame);
+  await withTimeout(session.send("Page.startScreencast", {
+    format: "jpeg",
+    quality: 48,
+    maxWidth: 1440,
+    maxHeight: 1000,
+    everyNthFrame: 1,
+  }), 3_000, "Visual recorder start");
+  return {
+    frames,
+    async stop() {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await withTimeout(session.send("Page.stopScreencast"), 2_000, "Visual recorder stop").catch(() => undefined);
+      session.off("Page.screencastFrame", onFrame);
+      await withTimeout(session.detach(), 1_000, "Visual recorder cleanup").catch(() => undefined);
+      return { durationMs: firstFrameAt && lastFrameAt ? Math.max(0, lastFrameAt - firstFrameAt) : 0 };
+    },
+  };
 }
 
 async function serializeDom(page) {
@@ -209,6 +280,10 @@ function normalizeRuntimeUrl(value) {
   }
 }
 
+function isOptionalRuntimeScriptPath(pathname) {
+  return /(?:\/cdn-cgi\/|\/analytics?\/|\/beacon\/|\/[a-f0-9]{12,}\/script\.js$)/i.test(pathname);
+}
+
 function absolutizeCssUrls(source, sourceUrl) {
   return source.replace(/url\s*\(\s*(["']?)([^"')]+)\1\s*\)/gi, (match, quote, rawUrl) => {
     const value = rawUrl.trim();
@@ -268,6 +343,8 @@ async function captureSite(sourceUrl, baseUrl) {
   const stylesheetBodies = new Map();
   const stylesheetCaptures = new Set();
   let networkRequests = 0;
+  let activeRequestCount = 0;
+  let visualRecorder;
 
   telemetrySession.on("Debugger.scriptParsed", (event) => {
     if (event.url && executedScripts.size < 600) executedScripts.add(normalizeRuntimeUrl(event.url));
@@ -300,6 +377,7 @@ async function captureSite(sourceUrl, baseUrl) {
   await page.setRequestInterception(true);
   page.on("request", async (request) => {
     networkRequests += 1;
+    activeRequestCount += 1;
     if (request.resourceType() === "script" && scriptRequests.size < 600) scriptRequests.add(normalizeRuntimeUrl(request.url()));
     try {
       const target = new URL(request.url());
@@ -311,6 +389,7 @@ async function captureSite(sourceUrl, baseUrl) {
     }
   });
   page.on("pageerror", (error) => runtimeErrors.push(String(error.message || error)));
+  page.on("requestfinished", () => { activeRequestCount = Math.max(0, activeRequestCount - 1); });
   page.on("response", (response) => {
     if (response.request().resourceType() !== "stylesheet" || stylesheetBodies.size + stylesheetCaptures.size >= 48) return;
     const sourceUrl = response.url();
@@ -323,34 +402,25 @@ async function captureSite(sourceUrl, baseUrl) {
     stylesheetCaptures.add(capture);
   });
   page.on("requestfailed", (request) => {
+    activeRequestCount = Math.max(0, activeRequestCount - 1);
     const type = request.resourceType();
     try {
       const requestUrl = new URL(request.url());
-      if (["document", "stylesheet", "script"].includes(type) && requestUrl.origin === sourceUrl.origin) criticalFailures.push(`${type}: ${requestUrl.pathname}`);
+      if (["document", "stylesheet", "script"].includes(type)
+        && requestUrl.origin === sourceUrl.origin
+        && !(type === "script" && isOptionalRuntimeScriptPath(requestUrl.pathname))) {
+        criticalFailures.push(`${type}: ${requestUrl.pathname}`);
+      }
     } catch { /* Non-HTTP browser-internal request. */ }
   });
   try {
     stage("instrument");
-    await page.evaluateOnNewDocument(rrwebScript);
-    await page.evaluateOnNewDocument(() => {
-      window.__originRrwebEvents = [];
-      window.addEventListener("DOMContentLoaded", () => {
-        if (window.rrweb?.record) {
-          window.__originStopRrweb = window.rrweb.record({
-            emit(event) {
-              if (window.__originRrwebEvents.length < 1200) window.__originRrwebEvents.push(event);
-            },
-            recordCanvas: false,
-            collectFonts: false,
-            checkoutEveryNms: 5000,
-          });
-        }
-      }, { once: true });
-    });
     stage("navigate");
     const response = await page.goto(sourceUrl.toString(), { waitUntil: "domcontentloaded", timeout: 30_000 });
     if (!response || response.status() >= 400) throw new Error(`The browser navigation returned HTTP ${response?.status() || "unknown"}.`);
     await new Promise((resolve) => setTimeout(resolve, 1800));
+    stage("network-settle");
+    await waitForNetworkQuiet(() => activeRequestCount, 12_000);
     stage("media");
     await withTimeout(prepareMedia(page), 8000, "Media preparation").catch(() => undefined);
     stage("styles");
@@ -365,39 +435,41 @@ async function captureSite(sourceUrl, baseUrl) {
       stylesheetsCaptured,
       cssBytes: Buffer.byteLength(capturedCss),
     }));
-    stage("screenshot-baseline");
-    const baselineScreenshot = await captureViewportScreenshot(page, 8_000, "Baseline screenshot capture")
-      .catch((error) => {
-        console.warn(JSON.stringify({
-          captureId,
-          stage: "screenshot-baseline-skipped",
-          elapsedMs: Date.now() - startedAt,
-          error: error instanceof Error ? error.message : "Baseline screenshot capture failed.",
-        }));
-        return null;
-      });
-    stage("replay");
-    let events = [];
-    try {
-      events = await withTimeout(page.evaluate(() => {
-        if (typeof window.__originStopRrweb === "function") window.__originStopRrweb();
-        return window.__originRrwebEvents || [];
-      }), 2500, "Replay serialization");
-    } catch { /* The rendered-DOM replay remains available. */ }
-    const replayTimestamps = events.map((event) => Number(event?.timestamp) || 0).filter(Boolean);
-    const replayDurationMs = replayTimestamps.length > 1 ? Math.max(...replayTimestamps) - Math.min(...replayTimestamps) : 0;
-    const replayMutations = events.filter((event) => event?.type === 3 && event?.data?.source === 0).length;
-    const replayReady = events.length >= 10 && replayDurationMs >= 5_000 && replayMutations > 0;
-    await withTimeout(telemetrySession.send("Page.stopLoading"), 2_000, "Page loading stop").catch(() => undefined);
-    stage("scroll");
-    const scroll = await withTimeout(autoScroll(page), 12_000, "Page scrolling");
+    stage("visual-recording");
+    visualRecorder = await startVisualRecorder(page).catch((error) => {
+      runtimeErrors.push(error instanceof Error ? error.message : "Visual recorder failed to start.");
+      return null;
+    });
     await new Promise((resolve) => setTimeout(resolve, 800));
+    stage("scroll");
+    const scroll = await withTimeout(autoScroll(page), 18_000, "Page scrolling");
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const visualReplay = visualRecorder ? await visualRecorder.stop() : { durationMs: 0 };
+    const visualFrames = visualRecorder?.frames || [];
+    visualRecorder = null;
+    const replayReady = visualFrames.length >= 3 && visualReplay.durationMs >= 500;
+    console.log(JSON.stringify({
+      captureId,
+      stage: "visual-recording-complete",
+      elapsedMs: Date.now() - startedAt,
+      frames: visualFrames.length,
+      durationMs: visualReplay.durationMs,
+      scroll,
+    }));
     stage("serialize");
     const renderedHtml = await withTimeout(serializeDom(page), 12_000, "DOM serialization");
     const metrics = summarizeMarkup(renderedHtml);
     const discoveredScriptUrls = [...scriptRequests];
     const executedScriptUrls = new Set(executedScripts);
     const unexecutedScriptUrls = discoveredScriptUrls.filter((url) => !executedScriptUrls.has(url));
+    const requiredUnexecutedScriptUrls = unexecutedScriptUrls.filter((url) => {
+      try {
+        const parsed = new URL(url);
+        return parsed.origin === sourceUrl.origin && !isOptionalRuntimeScriptPath(parsed.pathname);
+      } catch {
+        return false;
+      }
+    });
     stage("screenshot");
     const finalScreenshot = await captureViewportScreenshot(page, 8_000, "Final screenshot capture")
       .catch((error) => {
@@ -409,8 +481,8 @@ async function captureSite(sourceUrl, baseUrl) {
         }));
         return null;
       });
-    const screenshot = finalScreenshot || baselineScreenshot;
-    const screenshotFallbackUsed = Boolean(!finalScreenshot && baselineScreenshot);
+    const screenshot = finalScreenshot || visualFrames[0] || null;
+    const screenshotFallbackUsed = Boolean(!finalScreenshot && visualFrames[0]);
     const viewports = [1440, 1024, 768, 390];
     let responsiveViewports = 1;
     stage("responsive");
@@ -424,7 +496,7 @@ async function captureSite(sourceUrl, baseUrl) {
         runtimeErrors.push(error instanceof Error ? error.message : `${width}px layout validation failed.`);
       }
     }
-    artifacts.set(captureId, { createdAt: Date.now(), screenshot, events, replayReady, renderedHtml, sourceUrl: sourceUrl.toString() });
+    artifacts.set(captureId, { captureId, createdAt: Date.now(), screenshot, visualFrames, replayReady, renderedHtml, sourceUrl: sourceUrl.toString() });
     while (artifacts.size > MAX_RETAINED_CAPTURES) artifacts.delete(artifacts.keys().next().value);
     const checks = {
       loaded: true,
@@ -434,12 +506,12 @@ async function captureSite(sourceUrl, baseUrl) {
       responsive: responsiveViewports === viewports.length,
       domCaptured: renderedHtml.length > 100,
       screenshotCaptured: Boolean(screenshot),
-      runtimeScriptsExecuted: unexecutedScriptUrls.length === 0,
+      runtimeScriptsExecuted: requiredUnexecutedScriptUrls.length === 0 && !criticalFailures.some((failure) => failure.startsWith("script:")),
     };
     const verified = Object.values(checks).every(Boolean) && criticalFailures.length === 0 && runtimeErrors.length === 0;
     return {
       schemaVersion: "origin.capture/2",
-      provider: "origin-puppeteer-rrweb",
+      provider: "origin-cdp-visual-dom",
       captureId,
       state: verified ? "verified" : "partial",
       sourceUrl: sourceUrl.toString(),
@@ -465,9 +537,11 @@ async function captureSite(sourceUrl, baseUrl) {
         runtimeScriptsExecuted: discoveredScriptUrls.length - unexecutedScriptUrls.length,
         runtimeScriptsUnexecuted: unexecutedScriptUrls.length,
         animationsStarted: animations.size,
-        replayEvents: events.length,
-        replayDurationMs,
-        replayMutations,
+        replayEvents: visualFrames.length,
+        replayDurationMs: visualReplay.durationMs,
+        replayMutations: 0,
+        visualFrames: visualFrames.length,
+        visualReplayDurationMs: visualReplay.durationMs,
         stylesheetsCaptured,
         cssBytes: Buffer.byteLength(capturedCss),
         screenshotFallbackUsed,
@@ -478,11 +552,12 @@ async function captureSite(sourceUrl, baseUrl) {
         ...runtimeErrors.slice(0, 5),
         ...(!screenshot ? ["Viewport screenshot could not be captured."] : []),
         ...criticalFailures.slice(0, 10),
-        ...unexecutedScriptUrls.slice(0, 10).map((url) => `script not executed: ${url}`),
+        ...requiredUnexecutedScriptUrls.slice(0, 10).map((url) => `required script not executed: ${url}`),
       ],
     };
   } finally {
     stage("cleanup");
+    if (visualRecorder) await visualRecorder.stop().catch(() => undefined);
     await telemetrySession.detach().catch(() => undefined);
     await page.close().catch(() => undefined);
     browserPromise = undefined;
@@ -492,12 +567,16 @@ async function captureSite(sourceUrl, baseUrl) {
 }
 
 function replayDocument(artifact) {
+  if (artifact.replayReady && artifact.visualFrames?.length) {
+    const frameUrls = artifact.visualFrames.map((_, index) => `/captures/${artifact.captureId}/frames/${index}.jpg`);
+    const frames = JSON.stringify(frameUrls).replace(/</g, "\\u003c");
+    return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{height:100%;margin:0;background:#111;overflow:hidden}body{display:grid;place-items:center}img{display:block;width:100%;height:100%;object-fit:contain;background:#111}.badge{position:fixed;z-index:2;right:12px;bottom:12px;padding:6px 9px;border-radius:999px;background:#111c;color:#fff;font:600 11px/1 system-ui,sans-serif;letter-spacing:.05em}</style></head><body><img id="frame" alt="Recorded browser rendering"><span class="badge">RECORDED BROWSER MOTION</span><script>(()=>{const frames=${frames};const image=document.getElementById('frame');let index=0;const show=()=>{image.src=frames[index];index=(index+1)%frames.length};show();setInterval(show,320)})()</script></body></html>`;
+  }
   if (!artifact.replayReady) {
     const base = `<base href="${artifact.sourceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">`;
     return artifact.renderedHtml.replace(/<head([^>]*)>/i, `<head$1>${base}`);
   }
-  const events = JSON.stringify(artifact.events).replace(/</g, "\\u003c");
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rrweb-player@1.0.0-alpha.4/dist/style.css"><style>html,body,#replay{height:100%;margin:0;background:#fff}.rr-player{width:100%!important;height:100%!important}.rr-player__frame{width:100%!important;height:calc(100% - 80px)!important}</style></head><body><div id="replay"></div><script src="https://cdn.jsdelivr.net/npm/rrweb-player@1.0.0-alpha.4/dist/index.js"></script><script>new rrwebPlayer({target:document.getElementById('replay'),props:{events:${events},autoPlay:true,showController:true,width:1440,height:900}})</script></body></html>`;
+  return artifact.renderedHtml;
 }
 
 function requestBaseUrl(request) {
@@ -598,6 +677,14 @@ const server = http.createServer(async (request, response) => {
   try {
     if (request.method === "GET" && request.url === "/health") return json(response, 200, { ok: true, schemaVersion: "origin.capture/2" });
     const match = request.url?.match(/^\/captures\/([a-f0-9-]+)\/(replay|screenshot\.jpg)$/i);
+    const frameMatch = request.url?.match(/^\/captures\/([a-f0-9-]+)\/frames\/(\d+)\.jpg$/i);
+    if (request.method === "GET" && frameMatch) {
+      const artifact = artifacts.get(frameMatch[1]);
+      const frame = artifact?.visualFrames?.[Number(frameMatch[2])];
+      if (!frame) return json(response, 404, { error: "Capture frame expired or was not found." });
+      response.writeHead(200, { "content-type": "image/jpeg", "cache-control": "private, max-age=1800" });
+      return response.end(frame);
+    }
     if (request.method === "GET" && match) {
       const artifact = artifacts.get(match[1]);
       if (!artifact) return json(response, 404, { error: "Capture expired or was not found." });
@@ -607,7 +694,7 @@ const server = http.createServer(async (request, response) => {
         return response.end(artifact.screenshot);
       }
       const contentSecurityPolicy = artifact.replayReady
-        ? "default-src 'self' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src * data: blob:; media-src * data: blob:; font-src * data:"
+        ? "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
         : "default-src 'none'; script-src 'none'; style-src 'unsafe-inline' https:; img-src data: blob: https:; media-src data: blob: https:; font-src data: https:; frame-src https:; form-action 'none'; base-uri https:";
       response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": contentSecurityPolicy, "cache-control": "private, max-age=1800" });
       return response.end(replayDocument(artifact));
