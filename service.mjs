@@ -150,6 +150,21 @@ async function serializeDom(page) {
   }
 }
 
+async function captureViewportScreenshot(page, timeoutMs, label, quality = 68) {
+  const session = await page.createCDPSession();
+  try {
+    const result = await withTimeout(session.send("Page.captureScreenshot", {
+      format: "jpeg",
+      quality,
+      fromSurface: true,
+      captureBeyondViewport: false,
+    }), timeoutMs, label);
+    return Buffer.from(result.data, "base64");
+  } finally {
+    await withTimeout(session.detach(), 1_000, `${label} session cleanup`).catch(() => undefined);
+  }
+}
+
 async function prepareMedia(page) {
   await page.evaluate(async () => {
     document.querySelectorAll("img[loading='lazy'],iframe[loading='lazy']").forEach((element) => element.setAttribute("loading", "eager"));
@@ -350,6 +365,17 @@ async function captureSite(sourceUrl, baseUrl) {
       stylesheetsCaptured,
       cssBytes: Buffer.byteLength(capturedCss),
     }));
+    stage("screenshot-baseline");
+    const baselineScreenshot = await captureViewportScreenshot(page, 8_000, "Baseline screenshot capture")
+      .catch((error) => {
+        console.warn(JSON.stringify({
+          captureId,
+          stage: "screenshot-baseline-skipped",
+          elapsedMs: Date.now() - startedAt,
+          error: error instanceof Error ? error.message : "Baseline screenshot capture failed.",
+        }));
+        return null;
+      });
     stage("replay");
     let events = [];
     try {
@@ -373,7 +399,18 @@ async function captureSite(sourceUrl, baseUrl) {
     const executedScriptUrls = new Set(executedScripts);
     const unexecutedScriptUrls = discoveredScriptUrls.filter((url) => !executedScriptUrls.has(url));
     stage("screenshot");
-    const screenshot = await withTimeout(page.screenshot({ fullPage: false, type: "jpeg", quality: 68 }), 12_000, "Screenshot capture");
+    const finalScreenshot = await captureViewportScreenshot(page, 8_000, "Final screenshot capture")
+      .catch((error) => {
+        console.warn(JSON.stringify({
+          captureId,
+          stage: "screenshot-final-skipped",
+          elapsedMs: Date.now() - startedAt,
+          error: error instanceof Error ? error.message : "Final screenshot capture failed.",
+        }));
+        return null;
+      });
+    const screenshot = finalScreenshot || baselineScreenshot;
+    const screenshotFallbackUsed = Boolean(!finalScreenshot && baselineScreenshot);
     const viewports = [1440, 1024, 768, 390];
     let responsiveViewports = 1;
     stage("responsive");
@@ -381,7 +418,7 @@ async function captureSite(sourceUrl, baseUrl) {
       try {
         await withTimeout(page.setViewport({ width, height: width === 390 ? 844 : 900 }), 5000, `${width}px viewport setup`);
         await new Promise((resolve) => setTimeout(resolve, 280));
-        const frame = await withTimeout(page.screenshot({ fullPage: false, type: "jpeg", quality: 24 }), 5_000, `${width}px viewport validation`);
+        const frame = await captureViewportScreenshot(page, 5_000, `${width}px viewport validation`, 24);
         if (frame.length > 1_000) responsiveViewports += 1;
       } catch (error) {
         runtimeErrors.push(error instanceof Error ? error.message : `${width}px layout validation failed.`);
@@ -396,6 +433,7 @@ async function captureSite(sourceUrl, baseUrl) {
       replayable: replayReady,
       responsive: responsiveViewports === viewports.length,
       domCaptured: renderedHtml.length > 100,
+      screenshotCaptured: Boolean(screenshot),
       runtimeScriptsExecuted: unexecutedScriptUrls.length === 0,
     };
     const verified = Object.values(checks).every(Boolean) && criticalFailures.length === 0 && runtimeErrors.length === 0;
@@ -406,7 +444,7 @@ async function captureSite(sourceUrl, baseUrl) {
       state: verified ? "verified" : "partial",
       sourceUrl: sourceUrl.toString(),
       replayUrl: `${baseUrl}/captures/${captureId}/replay`,
-      screenshotUrl: `${baseUrl}/captures/${captureId}/screenshot.jpg`,
+      screenshotUrl: screenshot ? `${baseUrl}/captures/${captureId}/screenshot.jpg` : undefined,
       capturedAt: new Date().toISOString(),
       renderedHtml,
       capturedCss,
@@ -432,11 +470,13 @@ async function captureSite(sourceUrl, baseUrl) {
         replayMutations,
         stylesheetsCaptured,
         cssBytes: Buffer.byteLength(capturedCss),
+        screenshotFallbackUsed,
         criticalNetworkFailures: criticalFailures.length,
         runtimeErrors: runtimeErrors.length,
       },
       blockers: [
         ...runtimeErrors.slice(0, 5),
+        ...(!screenshot ? ["Viewport screenshot could not be captured."] : []),
         ...criticalFailures.slice(0, 10),
         ...unexecutedScriptUrls.slice(0, 10).map((url) => `script not executed: ${url}`),
       ],
@@ -445,6 +485,9 @@ async function captureSite(sourceUrl, baseUrl) {
     stage("cleanup");
     await telemetrySession.detach().catch(() => undefined);
     await page.close().catch(() => undefined);
+    browserPromise = undefined;
+    await withTimeout(browser.close(), 6_000, "Browser recycle").catch(() => undefined);
+    console.log(JSON.stringify({ captureId, stage: "browser-recycled", elapsedMs: Date.now() - startedAt }));
   }
 }
 
@@ -549,6 +592,7 @@ const server = http.createServer(async (request, response) => {
       const artifact = artifacts.get(match[1]);
       if (!artifact) return json(response, 404, { error: "Capture expired or was not found." });
       if (match[2] === "screenshot.jpg") {
+        if (!artifact.screenshot) return json(response, 404, { error: "A screenshot was not produced for this capture." });
         response.writeHead(200, { "content-type": "image/jpeg", "cache-control": "private, max-age=1800" });
         return response.end(artifact.screenshot);
       }
