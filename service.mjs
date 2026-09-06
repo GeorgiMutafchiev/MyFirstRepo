@@ -16,6 +16,12 @@ const jobs = new Map();
 const dnsCache = new Map();
 const MAX_RETAINED_CAPTURES = 3;
 const JOB_TTL_MS = 10 * 60_000;
+const TRANSIENT_OVERLAY_CSS = `
+[class*="loader_loader__"],[class*="preloader_preloader__"],[class*="splash_splash__"],
+[class*="loader-overlay"],[class*="loader-screen"],[class*="preloader-overlay"],[class*="preloader-screen"],
+[class*="splash-overlay"],[class*="splash-screen"],[class*="page-loader"],[class*="page-loading"],
+[class*="site-loader"],[class*="app-loader"],[class*="route-loader"],
+[id*="page-loader"],[id*="site-loader"],[id*="app-loader"]{display:none!important;visibility:hidden!important;pointer-events:none!important}`;
 let browserPromise;
 let captureQueue = Promise.resolve();
 
@@ -218,6 +224,17 @@ async function captureVisualPass(sourceUrl) {
   const page = await browser.newPage();
   let recorder;
   try {
+    await page.evaluateOnNewDocument((overlayCss) => {
+      const install = () => {
+        if (!document.documentElement || document.querySelector("style[data-origin-transient-overlays]")) return;
+        const style = document.createElement("style");
+        style.dataset.originTransientOverlays = "neutralized";
+        style.textContent = overlayCss;
+        document.documentElement.appendChild(style);
+      };
+      install();
+      document.addEventListener("DOMContentLoaded", install, { once: true });
+    }, TRANSIENT_OVERLAY_CSS);
     await page.setRequestInterception(true);
     page.on("request", async (request) => {
       try {
@@ -234,9 +251,13 @@ async function captureVisualPass(sourceUrl) {
     if (!response || response.status() >= 400) throw new Error(`The visual browser navigation returned HTTP ${response?.status() || "unknown"}.`);
     await new Promise((resolve) => setTimeout(resolve, 5_000));
     const result = await recorder.stop();
-    const frames = recorder.frames.slice(-12);
+    const recordedFrames = recorder.frames.slice(-12);
+    const firstSubstantiveFrame = recordedFrames.findIndex((frame) => frame.length >= 20_000);
+    const frames = firstSubstantiveFrame >= 0 ? recordedFrames.slice(firstSubstantiveFrame) : recordedFrames;
+    const substantiveFrames = frames.filter((frame) => frame.length >= 20_000).length;
+    const maxFrameBytes = Math.max(0, ...recordedFrames.map((frame) => frame.length));
     recorder = null;
-    return { frames, durationMs: result.durationMs };
+    return { frames, durationMs: result.durationMs, substantiveFrames, maxFrameBytes };
   } finally {
     if (recorder) await recorder.stop().catch(() => undefined);
     await page.close().catch(() => undefined);
@@ -332,9 +353,9 @@ function absolutizeCssUrls(source, sourceUrl) {
 
 function createInertStructureDocument(renderedHtml, sourceUrl, capturedCss) {
   const base = `<base href="${sourceUrl.toString().replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">`;
-  const styles = capturedCss
+  const styles = `<style data-origin-transient-overlays>${TRANSIENT_OVERLAY_CSS}</style>${capturedCss
     ? `<style data-origin-captured-css>${capturedCss.replace(/<\/style/gi, "<\\/style")}</style>`
-    : "";
+    : ""}`;
   const inertHtml = renderedHtml
     .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
     .replace(/<script\b[^>]*\/\s*>/gi, "");
@@ -379,6 +400,8 @@ async function captureSite(sourceUrl, baseUrl) {
   const visualPass = await withTimeout(captureVisualPass(sourceUrl), 48_000, "Visual browser pass").catch((error) => ({
     frames: [],
     durationMs: 0,
+    substantiveFrames: 0,
+    maxFrameBytes: 0,
     error: error instanceof Error ? error.message : "Visual browser pass failed.",
   }));
   console.log(JSON.stringify({
@@ -387,6 +410,8 @@ async function captureSite(sourceUrl, baseUrl) {
     elapsedMs: Date.now() - startedAt,
     frames: visualPass.frames.length,
     durationMs: visualPass.durationMs,
+    substantiveFrames: visualPass.substantiveFrames,
+    maxFrameBytes: visualPass.maxFrameBytes,
     error: visualPass.error,
   }));
   stage("browser");
@@ -406,6 +431,7 @@ async function captureSite(sourceUrl, baseUrl) {
   const visualFrames = visualPass.frames;
   const visualReplay = { durationMs: visualPass.durationMs };
   if (visualPass.error) runtimeErrors.push(visualPass.error);
+  if (!visualPass.substantiveFrames) runtimeErrors.push("Visual browser remained on a loading or low-detail frame.");
 
   telemetrySession.on("Debugger.scriptParsed", (event) => {
     if (event.url && executedScripts.size < 600) executedScripts.add(normalizeRuntimeUrl(event.url));
@@ -528,7 +554,7 @@ async function captureSite(sourceUrl, baseUrl) {
     stage("scroll");
     const scroll = await withTimeout(autoScroll(page), 18_000, "Page scrolling");
     await new Promise((resolve) => setTimeout(resolve, 600));
-    const replayReady = visualFrames.length >= 3 && visualReplay.durationMs >= 500;
+    const replayReady = visualFrames.length >= 3 && visualPass.substantiveFrames >= 2 && visualReplay.durationMs >= 500;
     console.log(JSON.stringify({
       captureId,
       stage: "visual-recording-complete",
@@ -608,6 +634,8 @@ async function captureSite(sourceUrl, baseUrl) {
         replayDurationMs: visualReplay.durationMs,
         replayMutations: 0,
         visualFrames: visualFrames.length,
+        visualSubstantiveFrames: visualPass.substantiveFrames,
+        visualMaxFrameBytes: visualPass.maxFrameBytes,
         visualReplayDurationMs: visualReplay.durationMs,
         stylesheetsCaptured,
         cssBytes: Buffer.byteLength(capturedCss),
