@@ -562,6 +562,17 @@ async function runSmokeCapture(rawUrl) {
     const job = await pollResponse.json();
     if (pollResponse.status === 202) continue;
     if (!pollResponse.ok || job.state !== "complete") throw new Error(job.error || `Smoke capture returned HTTP ${pollResponse.status}.`);
+    if (!job.artifact?.checks?.domCaptured || typeof job.artifact.renderedHtml !== "string") {
+      throw new Error("Smoke capture completed without a rendered DOM artifact.");
+    }
+    if (!job.artifact?.checks?.screenshotCaptured || typeof job.artifact.screenshotUrl !== "string") {
+      throw new Error("Smoke capture completed without a screenshot artifact.");
+    }
+    const screenshotResponse = await fetch(job.artifact.screenshotUrl, { headers });
+    const screenshotBytes = (await screenshotResponse.arrayBuffer()).byteLength;
+    if (!screenshotResponse.ok || screenshotBytes < 1_000) {
+      throw new Error(`Smoke screenshot verification returned HTTP ${screenshotResponse.status} with ${screenshotBytes} bytes.`);
+    }
     console.log(JSON.stringify({
       jobId: started.jobId,
       stage: "smoke-complete",
@@ -569,6 +580,8 @@ async function runSmokeCapture(rawUrl) {
       state: job.artifact?.state,
       checks: job.artifact?.checks,
       evidence: job.artifact?.evidence,
+      renderedHtmlBytes: Buffer.byteLength(job.artifact.renderedHtml),
+      screenshotBytes,
       blockers: job.artifact?.blockers,
     }));
     return;
