@@ -17,11 +17,11 @@ const dnsCache = new Map();
 const MAX_RETAINED_CAPTURES = 3;
 const JOB_TTL_MS = 10 * 60_000;
 const TRANSIENT_OVERLAY_CSS = `
-[class*="loader_loader__"],[class*="preloader_preloader__"],[class*="splash_splash__"],
-[class*="loader-overlay"],[class*="loader-screen"],[class*="preloader-overlay"],[class*="preloader-screen"],
-[class*="splash-overlay"],[class*="splash-screen"],[class*="page-loader"],[class*="page-loading"],
-[class*="site-loader"],[class*="app-loader"],[class*="route-loader"],
-[id*="page-loader"],[id*="site-loader"],[id*="app-loader"]{display:none!important;visibility:hidden!important;pointer-events:none!important}`;
+html body [class*="loader_loader__"],html body [class*="preloader_preloader__"],html body [class*="splash_splash__"],
+html body [class*="loader-overlay"],html body [class*="loader-screen"],html body [class*="preloader-overlay"],html body [class*="preloader-screen"],
+html body [class*="splash-overlay"],html body [class*="splash-screen"],html body [class*="page-loader"],html body [class*="page-loading"],
+html body [class*="site-loader"],html body [class*="app-loader"],html body [class*="route-loader"],
+html body [id*="page-loader"],html body [id*="site-loader"],html body [id*="app-loader"]{display:none!important;visibility:hidden!important;pointer-events:none!important}`;
 let browserPromise;
 let captureQueue = Promise.resolve();
 
@@ -229,12 +229,16 @@ async function captureVisualPass(sourceUrl) {
   let recorder;
   try {
     await page.evaluateOnNewDocument((overlayCss) => {
+      const selector = '[class*="loader_loader__"],[class*="preloader_preloader__"],[class*="splash_splash__"]';
+      const removeTransientOverlays = () => document.querySelectorAll(selector).forEach((element) => element.remove());
       const install = () => {
         if (!document.documentElement || document.querySelector("style[data-origin-transient-overlays]")) return;
         const style = document.createElement("style");
         style.dataset.originTransientOverlays = "neutralized";
         style.textContent = overlayCss;
         document.documentElement.appendChild(style);
+        removeTransientOverlays();
+        new MutationObserver(removeTransientOverlays).observe(document.documentElement, { childList: true, subtree: true });
       };
       install();
       document.addEventListener("DOMContentLoaded", install, { once: true });
