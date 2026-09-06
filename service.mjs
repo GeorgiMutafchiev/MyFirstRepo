@@ -330,6 +330,17 @@ function absolutizeCssUrls(source, sourceUrl) {
   });
 }
 
+function createInertStructureDocument(renderedHtml, sourceUrl, capturedCss) {
+  const base = `<base href="${sourceUrl.toString().replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">`;
+  const styles = capturedCss
+    ? `<style data-origin-captured-css>${capturedCss.replace(/<\/style/gi, "<\\/style")}</style>`
+    : "";
+  const inertHtml = renderedHtml
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
+    .replace(/<script\b[^>]*\/\s*>/gi, "");
+  return inertHtml.replace(/<head([^>]*)>/i, `<head$1>${base}${styles}`);
+}
+
 async function captureLoadedCss(session, stylesheetHeaders, stylesheetBodies) {
   const headers = [...stylesheetHeaders.values()].filter((header) => header.sourceURL).slice(0, 48);
   const results = await Promise.all(headers.map(async (header) => {
@@ -380,7 +391,7 @@ async function captureSite(sourceUrl, baseUrl) {
   }));
   stage("browser");
   const browser = await getBrowser();
-  const page = await browser.newPage();
+  let page = await browser.newPage();
   const telemetrySession = await page.createCDPSession();
   const runtimeErrors = [];
   const criticalFailures = [];
@@ -488,19 +499,7 @@ async function captureSite(sourceUrl, baseUrl) {
       stylesheetsCaptured,
       cssBytes: Buffer.byteLength(capturedCss),
     }));
-    stage("scroll");
-    const scroll = await withTimeout(autoScroll(page), 18_000, "Page scrolling");
-    await new Promise((resolve) => setTimeout(resolve, 600));
-    const replayReady = visualFrames.length >= 3 && visualReplay.durationMs >= 500;
-    console.log(JSON.stringify({
-      captureId,
-      stage: "visual-recording-complete",
-      elapsedMs: Date.now() - startedAt,
-      frames: visualFrames.length,
-      durationMs: visualReplay.durationMs,
-      scroll,
-    }));
-    stage("serialize");
+    stage("serialize-source");
     const renderedHtml = await withTimeout(serializeDom(page), 12_000, "DOM serialization");
     const metrics = summarizeMarkup(renderedHtml);
     const discoveredScriptUrls = [...scriptRequests];
@@ -514,6 +513,30 @@ async function captureSite(sourceUrl, baseUrl) {
         return false;
       }
     });
+    stage("structure-isolation");
+    await telemetrySession.detach().catch(() => undefined);
+    await page.close().catch(() => undefined);
+    page = await browser.newPage();
+    await page.setJavaScriptEnabled(false);
+    await page.setViewport({ width: 1440, height: 1000 });
+    await withTimeout(
+      page.setContent(createInertStructureDocument(renderedHtml, sourceUrl, capturedCss), { waitUntil: "domcontentloaded", timeout: 10_000 }),
+      12_000,
+      "Editable structure preparation",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    stage("scroll");
+    const scroll = await withTimeout(autoScroll(page), 18_000, "Page scrolling");
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const replayReady = visualFrames.length >= 3 && visualReplay.durationMs >= 500;
+    console.log(JSON.stringify({
+      captureId,
+      stage: "visual-recording-complete",
+      elapsedMs: Date.now() - startedAt,
+      frames: visualFrames.length,
+      durationMs: visualReplay.durationMs,
+      scroll,
+    }));
     stage("screenshot");
     const finalScreenshot = await captureViewportScreenshot(page, 8_000, "Final screenshot capture")
       .catch((error) => {
