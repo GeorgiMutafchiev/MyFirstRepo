@@ -775,7 +775,7 @@ const server = http.createServer(async (request, response) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Origin capture worker listening on ${PORT}`);
-  getBrowser().then(() => {
+  chromium.executablePath().then(() => {
     console.log("Origin capture browser ready");
     if (SMOKE_URL) runSmokeCapture(SMOKE_URL).catch((error) => {
       console.error(JSON.stringify({ stage: "smoke-failed", sourceUrl: SMOKE_URL, error: error instanceof Error ? error.message : "Smoke capture failed." }));
