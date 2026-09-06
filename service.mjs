@@ -19,20 +19,23 @@ const JOB_TTL_MS = 10 * 60_000;
 let browserPromise;
 let captureQueue = Promise.resolve();
 
+async function launchBrowser(graphicsMode) {
+  chromium.setGraphicsMode = graphicsMode;
+  return puppeteer.launch({
+    args: await puppeteer.defaultArgs({ args: chromium.args, headless: "shell" }),
+    defaultViewport: { width: 1440, height: 1000 },
+    executablePath: await chromium.executablePath(),
+    headless: "shell",
+    timeout: 90_000,
+  });
+}
+
 function getBrowser() {
   if (!browserPromise) {
-    browserPromise = (async () => {
-      chromium.setGraphicsMode = true;
-      const browser = await puppeteer.launch({
-        args: await puppeteer.defaultArgs({ args: chromium.args, headless: "shell" }),
-        defaultViewport: { width: 1440, height: 1000 },
-        executablePath: await chromium.executablePath(),
-        headless: "shell",
-        timeout: 90_000,
-      });
+    browserPromise = launchBrowser(false).then((browser) => {
       browser.once("disconnected", () => { browserPromise = undefined; });
       return browser;
-    })().catch((error) => {
+    }).catch((error) => {
       browserPromise = undefined;
       throw error;
     });
@@ -182,7 +185,7 @@ async function startVisualRecorder(page) {
   const onFrame = (event) => {
     session.send("Page.screencastFrameAck", { sessionId: event.sessionId }).catch(() => undefined);
     const now = Date.now();
-    if (frames.length >= 18 || now - lastAcceptedAt < 280) return;
+    if (frames.length >= 18 || now - lastAcceptedAt < 650) return;
     const frame = Buffer.from(event.data || "", "base64");
     if (frame.length < 1_000) return;
     frames.push(frame);
@@ -208,6 +211,37 @@ async function startVisualRecorder(page) {
       return { durationMs: firstFrameAt && lastFrameAt ? Math.max(0, lastFrameAt - firstFrameAt) : 0 };
     },
   };
+}
+
+async function captureVisualPass(sourceUrl) {
+  const browser = await launchBrowser(true);
+  const page = await browser.newPage();
+  let recorder;
+  try {
+    await page.setRequestInterception(true);
+    page.on("request", async (request) => {
+      try {
+        const target = new URL(request.url());
+        if (target.protocol === "http:" || target.protocol === "https:") await validateTarget(target.toString());
+        else if (!["data:", "blob:", "about:"].includes(target.protocol)) throw new Error("Blocked non-web request.");
+        return request.continue();
+      } catch {
+        return request.abort("blockedbyclient");
+      }
+    });
+    recorder = await startVisualRecorder(page);
+    const response = await page.goto(sourceUrl.toString(), { waitUntil: "domcontentloaded", timeout: 30_000 });
+    if (!response || response.status() >= 400) throw new Error(`The visual browser navigation returned HTTP ${response?.status() || "unknown"}.`);
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    const result = await recorder.stop();
+    const frames = recorder.frames.slice(-12);
+    recorder = null;
+    return { frames, durationMs: result.durationMs };
+  } finally {
+    if (recorder) await recorder.stop().catch(() => undefined);
+    await page.close().catch(() => undefined);
+    await withTimeout(browser.close(), 6_000, "Visual browser recycle").catch(() => undefined);
+  }
 }
 
 async function serializeDom(page) {
@@ -330,6 +364,20 @@ async function captureSite(sourceUrl, baseUrl) {
   const captureId = randomUUID();
   const startedAt = Date.now();
   const stage = (name) => console.log(JSON.stringify({ captureId, stage: name, elapsedMs: Date.now() - startedAt }));
+  stage("visual-browser");
+  const visualPass = await withTimeout(captureVisualPass(sourceUrl), 48_000, "Visual browser pass").catch((error) => ({
+    frames: [],
+    durationMs: 0,
+    error: error instanceof Error ? error.message : "Visual browser pass failed.",
+  }));
+  console.log(JSON.stringify({
+    captureId,
+    stage: "visual-browser-complete",
+    elapsedMs: Date.now() - startedAt,
+    frames: visualPass.frames.length,
+    durationMs: visualPass.durationMs,
+    error: visualPass.error,
+  }));
   stage("browser");
   const browser = await getBrowser();
   const page = await browser.newPage();
@@ -344,7 +392,9 @@ async function captureSite(sourceUrl, baseUrl) {
   const stylesheetCaptures = new Set();
   let networkRequests = 0;
   let activeRequestCount = 0;
-  let visualRecorder;
+  const visualFrames = visualPass.frames;
+  const visualReplay = { durationMs: visualPass.durationMs };
+  if (visualPass.error) runtimeErrors.push(visualPass.error);
 
   telemetrySession.on("Debugger.scriptParsed", (event) => {
     if (event.url && executedScripts.size < 600) executedScripts.add(normalizeRuntimeUrl(event.url));
@@ -388,7 +438,10 @@ async function captureSite(sourceUrl, baseUrl) {
       return request.abort("blockedbyclient");
     }
   });
-  page.on("pageerror", (error) => runtimeErrors.push(String(error.message || error)));
+  page.on("pageerror", (error) => {
+    const message = String(error.message || error);
+    if (!/webgl|gpu process|graphics context|error creating .*context/i.test(message)) runtimeErrors.push(message);
+  });
   page.on("requestfinished", () => { activeRequestCount = Math.max(0, activeRequestCount - 1); });
   page.on("response", (response) => {
     if (response.request().resourceType() !== "stylesheet" || stylesheetBodies.size + stylesheetCaptures.size >= 48) return;
@@ -435,18 +488,9 @@ async function captureSite(sourceUrl, baseUrl) {
       stylesheetsCaptured,
       cssBytes: Buffer.byteLength(capturedCss),
     }));
-    stage("visual-recording");
-    visualRecorder = await startVisualRecorder(page).catch((error) => {
-      runtimeErrors.push(error instanceof Error ? error.message : "Visual recorder failed to start.");
-      return null;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 800));
     stage("scroll");
     const scroll = await withTimeout(autoScroll(page), 18_000, "Page scrolling");
     await new Promise((resolve) => setTimeout(resolve, 600));
-    const visualReplay = visualRecorder ? await visualRecorder.stop() : { durationMs: 0 };
-    const visualFrames = visualRecorder?.frames || [];
-    visualRecorder = null;
     const replayReady = visualFrames.length >= 3 && visualReplay.durationMs >= 500;
     console.log(JSON.stringify({
       captureId,
@@ -481,8 +525,8 @@ async function captureSite(sourceUrl, baseUrl) {
         }));
         return null;
       });
-    const screenshot = finalScreenshot || visualFrames[0] || null;
-    const screenshotFallbackUsed = Boolean(!finalScreenshot && visualFrames[0]);
+    const screenshot = visualFrames.at(-1) || finalScreenshot || null;
+    const screenshotFallbackUsed = Boolean(visualFrames.length || (!finalScreenshot && screenshot));
     const viewports = [1440, 1024, 768, 390];
     let responsiveViewports = 1;
     stage("responsive");
@@ -557,7 +601,6 @@ async function captureSite(sourceUrl, baseUrl) {
     };
   } finally {
     stage("cleanup");
-    if (visualRecorder) await visualRecorder.stop().catch(() => undefined);
     await telemetrySession.detach().catch(() => undefined);
     await page.close().catch(() => undefined);
     browserPromise = undefined;
