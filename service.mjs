@@ -139,7 +139,11 @@ async function autoScroll(page) {
   }), 2_000, "Browser wheel scroll").then(() => true).catch(() => false);
 
   try {
-    const initial = await layout();
+    let initial = null;
+    for (let attempt = 0; attempt < 10 && !initial; attempt += 1) {
+      initial = await layout();
+      if (!initial) await new Promise((resolve) => setTimeout(resolve, 300));
+    }
     let current = initial;
     let maxScrollY = current?.pageY || 0;
     let steps = 0;
@@ -249,6 +253,16 @@ async function captureVisualPass(sourceUrl) {
     recorder = await startVisualRecorder(page);
     const response = await page.goto(sourceUrl.toString(), { waitUntil: "domcontentloaded", timeout: 30_000 });
     if (!response || response.status() >= 400) throw new Error(`The visual browser navigation returned HTTP ${response?.status() || "unknown"}.`);
+    await withTimeout(page.evaluate((overlayCss) => {
+      let style = document.querySelector("style[data-origin-transient-overlays]");
+      if (!style) {
+        style = document.createElement("style");
+        style.dataset.originTransientOverlays = "neutralized";
+        document.documentElement.appendChild(style);
+      }
+      style.textContent = overlayCss;
+      document.querySelectorAll('[class*="loader_loader__"],[class*="preloader_preloader__"],[class*="splash_splash__"]').forEach((element) => element.remove());
+    }, TRANSIENT_OVERLAY_CSS), 2_500, "Transient overlay removal").catch(() => undefined);
     await new Promise((resolve) => setTimeout(resolve, 5_000));
     const result = await recorder.stop();
     const recordedFrames = recorder.frames.slice(-12);
@@ -574,8 +588,8 @@ async function captureSite(sourceUrl, baseUrl) {
         }));
         return null;
       });
-    const screenshot = visualFrames.at(-1) || finalScreenshot || null;
-    const screenshotFallbackUsed = Boolean(visualFrames.length || (!finalScreenshot && screenshot));
+    const screenshot = (visualPass.substantiveFrames ? visualFrames.at(-1) : null) || finalScreenshot || null;
+    const screenshotFallbackUsed = Boolean(visualPass.substantiveFrames || (!finalScreenshot && screenshot));
     const viewports = [1440, 1024, 768, 390];
     let responsiveViewports = 1;
     stage("responsive");
@@ -667,8 +681,7 @@ function replayDocument(artifact) {
     return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{height:100%;margin:0;background:#111;overflow:hidden}body{display:grid;place-items:center}img{display:block;width:100%;height:100%;object-fit:contain;background:#111}.badge{position:fixed;z-index:2;right:12px;bottom:12px;padding:6px 9px;border-radius:999px;background:#111c;color:#fff;font:600 11px/1 system-ui,sans-serif;letter-spacing:.05em}</style></head><body><img id="frame" alt="Recorded browser rendering"><span class="badge">RECORDED BROWSER MOTION</span><script>(()=>{const frames=${frames};const image=document.getElementById('frame');let index=0;const show=()=>{image.src=frames[index];index=(index+1)%frames.length};show();setInterval(show,320)})()</script></body></html>`;
   }
   if (!artifact.replayReady) {
-    const base = `<base href="${artifact.sourceUrl.replaceAll("&", "&amp;").replaceAll('"', "&quot;")}">`;
-    return artifact.renderedHtml.replace(/<head([^>]*)>/i, `<head$1>${base}`);
+    return createInertStructureDocument(artifact.renderedHtml, new URL(artifact.sourceUrl), "");
   }
   return artifact.renderedHtml;
 }
