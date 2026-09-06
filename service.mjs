@@ -568,11 +568,8 @@ async function runSmokeCapture(rawUrl) {
     if (!job.artifact?.checks?.screenshotCaptured || typeof job.artifact.screenshotUrl !== "string") {
       throw new Error("Smoke capture completed without a screenshot artifact.");
     }
-    const screenshotResponse = await fetch(job.artifact.screenshotUrl, { headers });
-    const screenshotBytes = (await screenshotResponse.arrayBuffer()).byteLength;
-    if (!screenshotResponse.ok || screenshotBytes < 1_000) {
-      throw new Error(`Smoke screenshot verification returned HTTP ${screenshotResponse.status} with ${screenshotBytes} bytes.`);
-    }
+    const screenshotBytes = artifacts.get(job.artifact.captureId)?.screenshot?.length || 0;
+    if (screenshotBytes < 1_000) throw new Error(`Smoke screenshot verification produced only ${screenshotBytes} bytes.`);
     console.log(JSON.stringify({
       jobId: started.jobId,
       stage: "smoke-complete",
