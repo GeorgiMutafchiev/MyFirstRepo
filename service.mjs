@@ -357,7 +357,7 @@ function normalizeRuntimeUrl(value) {
 }
 
 function isOptionalRuntimeScriptPath(pathname) {
-  return /(?:\/cdn-cgi\/|\/analytics?\/|\/beacon\/|\/[a-f0-9]{12,}\/script\.js$)/i.test(pathname);
+  return /(?:\/cdn-cgi\/|\/analytics?\/|\/beacon\/|\/[a-f0-9]{12,}\/script\.js$|\/_next\/static\/chunks\/\d+\.[a-f0-9]+\.js$)/i.test(pathname);
 }
 
 function absolutizeCssUrls(source, sourceUrl) {
