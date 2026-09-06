@@ -114,7 +114,7 @@ async function waitForNetworkQuiet(activeRequests, timeoutMs = 12_000) {
   return false;
 }
 
-async function autoScroll(page) {
+async function autoScroll(page, onStep) {
   const session = await page.createCDPSession();
   const layout = async () => {
     try {
@@ -147,6 +147,7 @@ async function autoScroll(page) {
     let current = initial;
     let maxScrollY = current?.pageY || 0;
     let steps = 0;
+    if (initial && onStep) await onStep(initial, 0);
     for (let index = 0; index < 12; index += 1) {
       const remaining = current ? Math.max(0, current.contentHeight - current.viewportHeight - current.pageY) : 1_100;
       if (current && remaining <= 8) break;
@@ -155,6 +156,7 @@ async function autoScroll(page) {
       await new Promise((resolve) => setTimeout(resolve, 320));
       current = await layout() || current;
       maxScrollY = Math.max(maxScrollY, current?.pageY || 0);
+      if (current && onStep) await onStep(current, steps);
     }
     const final = await layout() || current;
     const bottomReached = Boolean(final && final.contentHeight - final.viewportHeight - final.pageY <= 16);
@@ -171,6 +173,7 @@ async function autoScroll(page) {
     await new Promise((resolve) => setTimeout(resolve, 350));
     const returned = await layout();
     const returnedToTop = Boolean(returned && returned.pageY <= 8);
+    if (returned && onStep) await onStep(returned, steps + 1);
     return {
       initialHeight: initial?.contentHeight || 0,
       finalHeight: final?.contentHeight || 0,
@@ -570,15 +573,25 @@ async function captureSite(sourceUrl, baseUrl) {
     );
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     stage("scroll");
-    const scroll = await withTimeout(autoScroll(page), 18_000, "Page scrolling");
+    const structureFrames = [];
+    const scroll = await withTimeout(autoScroll(page, async (_layout, step) => {
+      if (structureFrames.length >= 10 || (step > 0 && step < 12 && step % 2 !== 0)) return;
+      const frame = await captureViewportScreenshot(page, 3_500, "Editable structure replay frame", 45).catch(() => null);
+      if (frame && frame.length >= 20_000) structureFrames.push(frame);
+    }), 30_000, "Page scrolling");
     await new Promise((resolve) => setTimeout(resolve, 600));
-    const replayReady = visualFrames.length >= 3 && visualPass.substantiveFrames >= 2 && visualReplay.durationMs >= 500;
+    const sourceReplayReady = visualFrames.length >= 3 && visualPass.substantiveFrames >= 2 && visualReplay.durationMs >= 500;
+    const replayFrames = sourceReplayReady ? visualFrames : structureFrames;
+    const replayMode = sourceReplayReady ? "source-visual" : "structure-scroll";
+    const replayReady = replayFrames.length >= 3;
     console.log(JSON.stringify({
       captureId,
       stage: "visual-recording-complete",
       elapsedMs: Date.now() - startedAt,
       frames: visualFrames.length,
       durationMs: visualReplay.durationMs,
+      replayMode,
+      replayFrames: replayFrames.length,
       scroll,
     }));
     stage("screenshot");
@@ -592,7 +605,7 @@ async function captureSite(sourceUrl, baseUrl) {
         }));
         return null;
       });
-    const screenshot = (visualPass.substantiveFrames ? visualFrames.at(-1) : null) || finalScreenshot || null;
+    const screenshot = (visualPass.substantiveFrames ? visualFrames.at(-1) : null) || structureFrames[0] || finalScreenshot || null;
     const screenshotFallbackUsed = Boolean(visualPass.substantiveFrames || (!finalScreenshot && screenshot));
     const viewports = [1440, 1024, 768, 390];
     let responsiveViewports = 1;
@@ -607,7 +620,7 @@ async function captureSite(sourceUrl, baseUrl) {
         runtimeErrors.push(error instanceof Error ? error.message : `${width}px layout validation failed.`);
       }
     }
-    artifacts.set(captureId, { captureId, createdAt: Date.now(), screenshot, visualFrames, replayReady, renderedHtml, sourceUrl: sourceUrl.toString() });
+    artifacts.set(captureId, { captureId, createdAt: Date.now(), screenshot, visualFrames: replayFrames, replayMode, replayReady, renderedHtml, sourceUrl: sourceUrl.toString() });
     while (artifacts.size > MAX_RETAINED_CAPTURES) artifacts.delete(artifacts.keys().next().value);
     const checks = {
       loaded: true,
@@ -648,13 +661,15 @@ async function captureSite(sourceUrl, baseUrl) {
         runtimeScriptsExecuted: discoveredScriptUrls.length - unexecutedScriptUrls.length,
         runtimeScriptsUnexecuted: unexecutedScriptUrls.length,
         animationsStarted: animations.size,
-        replayEvents: visualFrames.length,
-        replayDurationMs: visualReplay.durationMs,
+        replayEvents: replayFrames.length,
+        replayDurationMs: sourceReplayReady ? visualReplay.durationMs : Math.max(0, replayFrames.length - 1) * 320,
         replayMutations: 0,
         visualFrames: visualFrames.length,
         visualSubstantiveFrames: visualPass.substantiveFrames,
         visualMaxFrameBytes: visualPass.maxFrameBytes,
         visualReplayDurationMs: visualReplay.durationMs,
+        structureReplayFrames: structureFrames.length,
+        replayMode,
         stylesheetsCaptured,
         cssBytes: Buffer.byteLength(capturedCss),
         screenshotFallbackUsed,
@@ -682,7 +697,8 @@ function replayDocument(artifact) {
   if (artifact.replayReady && artifact.visualFrames?.length) {
     const frameUrls = artifact.visualFrames.map((_, index) => `/captures/${artifact.captureId}/frames/${index}.jpg`);
     const frames = JSON.stringify(frameUrls).replace(/</g, "\\u003c");
-    return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{height:100%;margin:0;background:#111;overflow:hidden}body{display:grid;place-items:center}img{display:block;width:100%;height:100%;object-fit:contain;background:#111}.badge{position:fixed;z-index:2;right:12px;bottom:12px;padding:6px 9px;border-radius:999px;background:#111c;color:#fff;font:600 11px/1 system-ui,sans-serif;letter-spacing:.05em}</style></head><body><img id="frame" alt="Recorded browser rendering"><span class="badge">RECORDED BROWSER MOTION</span><script>(()=>{const frames=${frames};const image=document.getElementById('frame');let index=0;const show=()=>{image.src=frames[index];index=(index+1)%frames.length};show();setInterval(show,320)})()</script></body></html>`;
+    const badge = artifact.replayMode === "source-visual" ? "RECORDED SOURCE MOTION" : "EDITABLE STRUCTURE REPLAY";
+    return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{height:100%;margin:0;background:#111;overflow:hidden}body{display:grid;place-items:center}img{display:block;width:100%;height:100%;object-fit:contain;background:#111}.badge{position:fixed;z-index:2;right:12px;bottom:12px;padding:6px 9px;border-radius:999px;background:#111c;color:#fff;font:600 11px/1 system-ui,sans-serif;letter-spacing:.05em}</style></head><body><img id="frame" alt="Recorded browser rendering"><span class="badge">${badge}</span><script>(()=>{const frames=${frames};const image=document.getElementById('frame');let index=0;const show=()=>{image.src=frames[index];index=(index+1)%frames.length};show();setInterval(show,320)})()</script></body></html>`;
   }
   if (!artifact.replayReady) {
     return createInertStructureDocument(artifact.renderedHtml, new URL(artifact.sourceUrl), "");
